@@ -1,0 +1,11 @@
+namespace unsequenced;
+
+table UnsequencedInput {
+	app_id:uint32;
+	instance_id:uint16;
+	cluster_id:uint16;
+	sequence_number:uint32;
+	payload:[ubyte];
+}
+
+root_type UnsequencedInput;
