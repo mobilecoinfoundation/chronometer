@@ -1,17 +1,11 @@
 use tokio;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{UdpSocket};
 use clap::Parser;
 use std::net::{
     Ipv6Addr, SocketAddrV6
 };
-use flatbuffers::FlatBufferBuilder;
 use byteorder::{ByteOrder, NetworkEndian, NativeEndian};
-
-#[path = "../target/flatbuffers/unsequenced_generated.rs"]
-pub mod unsequenced_generated;
-use unsequenced_generated::unsequenced::*;
-use crate::root_as_unsequenced_input;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -22,82 +16,48 @@ struct Args {
     port: u16
 }
 
-struct InboundConnection {
-    socket: TcpStream
+use rkyv::{Archive, Deserialize, Serialize, AlignedVec, Archived};
+use bytecheck::CheckBytes;
+
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[archive(compare(PartialEq))]
+#[archive_attr(derive(CheckBytes, Debug))]
+struct UnsequencedInput {
+    app_id: u32,
+    instance_id: u16,
+    cluster_id: u16,
+    sequence_number: u64,
+    payload: Vec<u8>
 }
 
-impl InboundConnection {
-    pub fn new(socket: TcpStream) -> InboundConnection {
-        InboundConnection {
-            socket
-        }
-    }
-    
-    pub async fn start(mut self) -> std::io::Result<()> {
-        loop {
-            if let Err(e) = self.receive_framed().await {
-                eprintln!("connection closed: {:?}", e);
-                return Err(e);
-            }
-        }
-    }
-    
-    async fn receive_framed(&mut self) -> std::io::Result<()> {
-        let mut buf = [0; flatbuffers::SIZE_SIZEPREFIX];
-        let n = match self.socket.read_exact(&mut buf).await {
-            Ok(n) if n == 0 => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("failed to read from socket, error {:?}", e);
-                return Err(e);
-            }
-        };
-        assert!(flatbuffers::SIZE_SIZEPREFIX == flatbuffers::SIZE_U32);
-        //let length = NetworkEndian::read_u32(&buf);
-        let length = NativeEndian::read_u32(&buf);
-        println!("received {}({}) bytes, {:?}", length, n, buf);
-        
-        let mut buffer = vec![0; length as usize];
-        let n = match self.socket.read_exact(&mut buffer).await {
-            Ok(n) if n == 0 => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("failed to read from socket, error {:?}", e);
-                return Err(e);
-            }
-        };
-        
-        println!("received {}({}) bytes, {:?}", buffer.len(), n, buffer);
-        
-        let res = unsequenced_generated::unsequenced::root_as_unsequenced_input(&buffer);
- 
-        println!("{:?}", res);
-        
-        Ok(())
-    }
-}
-
-struct InboundConnectionServer {
+struct InboundServer {
     port: u16
 }
 
-impl InboundConnectionServer {
-    pub fn new(port: u16) -> InboundConnectionServer {
-        InboundConnectionServer {
+impl InboundServer {
+    pub fn new(port: u16) -> InboundServer {
+        InboundServer {
             port
         }
     }
     
     pub async fn start(self) -> std::io::Result<()> {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, self.port, 0, 0);
-        let listener = TcpListener::bind(addr).await?;
+        let listener = UdpSocket::bind(addr).await?;
         
         println!("Hello, world on port {:?}!", listener);
+        let mut recv_buffer = vec![0u8; 2048];
         loop {
-            let (socket, _) = listener.accept().await.unwrap();
-            println!("{:?}", socket);
-            let inbound_connection = InboundConnection::new(socket);
-            tokio::spawn(inbound_connection.start());
+            let (len, addr) = listener.recv_from(&mut recv_buffer).await?;
+            println!("{}, {:?}", len, addr);
+            let data_res = rkyv::check_archived_root::<UnsequencedInput>(&recv_buffer[..len]);
+
+            if let Ok(data) = data_res {
+                println!("Received unsequenced input: {:?}", data);
+            }
+            else {
+                println!("Received error: {:?}", data_res);
+            }
         }
     }
 }
@@ -106,7 +66,7 @@ impl InboundConnectionServer {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     
-    let inbound_server = InboundConnectionServer::new(args.port);
+    let inbound_server = InboundServer::new(args.port);
     let join_handle = tokio::spawn(inbound_server.start());
     
     join_handle.await?
@@ -114,33 +74,33 @@ async fn main() -> std::io::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming() {
-    // Build a flatbuffer
-    let mut builder = FlatBufferBuilder::new();
-    let mut dest: Vec<u8> = vec![];
-    
-    let args = UnsequencedInputArgs {
+    // Build an archive
+    let input = UnsequencedInput {
         app_id: 1,
         instance_id: 2,
         cluster_id: 3,
         sequence_number: 4,
-        payload: None
+        payload: vec![]
     };
     
-    let offset = UnsequencedInput::create(&mut builder, &args);
-    finish_size_prefixed_unsequenced_input_buffer(&mut builder, offset);
+    let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
     
-    dest.extend_from_slice(builder.finished_data());
+    println!("data is: {:?}", data);
     
     // Start a server
-    let inbound_server = InboundConnectionServer::new(9999);
+    let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
+    let inbound_server = InboundServer::new(server_addr.port());
     let join_handle = tokio::spawn(inbound_server.start());
 
     // Start a client
-    let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-    let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+    let mut client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+    println!("client is at {:?}", client.local_addr());
+    // client.connect(&server_addr).await.unwrap();
 
     // Send the flatbuffer
-    client.write_all(&dest).await.unwrap();
+    let res = client.send_to(&data, &server_addr).await;
+    println!("{:?}", res);
     
     join_handle.await;
 }

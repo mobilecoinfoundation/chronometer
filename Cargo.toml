@@ -9,7 +9,6 @@ edition = "2021"
 tokio = { version = "1.16", features = ["full"] }
 clap = { version = "3.1", features = ["derive"] }
 byteorder = { version = "1.3" }
-flatbuffers = { version = "*" }
-
-[build-dependencies]
-flatc-rust = "*"
+bytes = { version = "1.1.0" }
+bytecheck = { version = "*" }
+rkyv = { version = "0.7", features = ["validation"] }
