@@ -6,6 +6,7 @@ use std::net::{
     Ipv6Addr, SocketAddrV6
 };
 use byteorder::{ByteOrder, NetworkEndian, NativeEndian};
+use unsequenced_producer::UnsequencedInput;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -18,17 +19,6 @@ struct Args {
 
 use rkyv::{Archive, Deserialize, Serialize, AlignedVec, Archived};
 use bytecheck::CheckBytes;
-
-#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(compare(PartialEq))]
-#[archive_attr(derive(CheckBytes, Debug))]
-struct UnsequencedInput {
-    app_id: u32,
-    instance_id: u16,
-    cluster_id: u16,
-    sequence_number: u64,
-    payload: Vec<u8>
-}
 
 struct InboundServer {
     port: u16
@@ -75,13 +65,7 @@ async fn main() -> std::io::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming() {
     // Build an archive
-    let input = UnsequencedInput {
-        app_id: 1,
-        instance_id: 2,
-        cluster_id: 3,
-        sequence_number: 4,
-        payload: vec![]
-    };
+    let input = UnsequencedInput::new(1, 2, 3, 4, vec![]);
     
     let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
     
