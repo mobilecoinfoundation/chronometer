@@ -10,11 +10,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[archive(compare(PartialEq))]
 #[archive_attr(derive(CheckBytes, Debug))]
 pub struct UnsequencedInput {
-    app_id: u32,
-    instance_id: u16,
-    cluster_id: u16,
-    sequence_number: u64,
-    payload: Vec<u8>,
+    pub app_id: u32,
+    pub instance_id: u16,
+    pub cluster_id: u16,
+    pub sequence_number: u64,
+    pub payload: Vec<u8>,
 }
 
 impl UnsequencedInput {
