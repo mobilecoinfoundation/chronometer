@@ -367,7 +367,7 @@ mod test {
         let example_message = "Foo, and also bar!";
         let payload = example_message.as_bytes().to_vec();
         // Build an archive
-        let input = SequencerMessage::new(1 as AppId, 1, 2, (NUM_MESSAGE_TEST + 1) as u64, payload);
+        let input = SequencerMessage::new(1_u16, 1, 2, (NUM_MESSAGE_TEST + 1) as u64, payload);
         let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
 
         // Start a client
