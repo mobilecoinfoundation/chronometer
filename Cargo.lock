@@ -435,6 +435,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "clap",
+ "lazy_static",
  "memmap2",
  "pin-project",
  "rkyv",

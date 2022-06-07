@@ -136,165 +136,190 @@ async fn main() -> std::io::Result<()> {
     join_handle.await?.map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)) )
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_stream_received() {
-    use rkyv::Deserialize;
-    use std::time::Duration;
-    use tokio::time::timeout;
 
-    // Dummy message for testing. 
-    let example_message = "Hello, world!";
-    let payload = example_message.as_bytes().to_vec();
-    // Build an archive
-    let input = SequencerMessage::new(1, 2, 3, 4, payload);
+#[cfg(test)]
+mod test {
+    use tokio::sync::Mutex;
+    use lazy_static::lazy_static;
+    use super::*;
 
-    let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+    // Any localhost-related network tests will interfere with eachother if you use the 
+    // cargo test command, which is multithreaded by default.
+    // Passing -- --test-threads=1 will get around this, but this may be unclear to new users (and, possibly, to CI servers!)
+    // so I have created this mutex as a workaround. 
+    lazy_static!{ 
+        static ref IO_TEST_PERMISSIONS: Mutex<()> = Mutex::new(());
+    }
 
-    println!("data is: {:?}", data);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_received() {
+        use rkyv::Deserialize;
+        use std::time::Duration;
+        use tokio::time::timeout;
 
-    // Start a server
-    let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-    let inbound_server = InboundServer::new(server_addr.port());
-    // Set up our decoded message channel.
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    // Initialize the sequencer's polling loop.
-    let _join_handle = tokio::spawn(
-        inbound_server.start( 
-        #[inline(always)]
-            move |message| {
-                let deserialized: SequencerMessage = message.get_ref().deserialize(&mut rkyv::Infallible).unwrap(); 
-                let res = sender.send( deserialized );
-                if let Err(e) = res { 
-                    panic!("Failed to send on an unbounded channel: {0:?}", e);
+        // Prevent tests from interfering with eachother over the localhost connection.
+        // This should implicitly drop when the test ends.
+        let _guard = IO_TEST_PERMISSIONS.lock().await;
+
+        // Dummy message for testing. 
+        let example_message = "Hello, world!";
+        let payload = example_message.as_bytes().to_vec();
+        // Build an archive
+        let input = SequencerMessage::new(1, 2, 3, 4, payload);
+
+        let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+
+        println!("data is: {:?}", data);
+
+        // Start a server
+        let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
+        let inbound_server = InboundServer::new(server_addr.port());
+        // Set up our decoded message channel.
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        // Initialize the sequencer's polling loop.
+        let _join_handle = tokio::spawn(
+            inbound_server.start( 
+            #[inline(always)]
+                move |message| {
+                    let deserialized: SequencerMessage = message.get_ref().deserialize(&mut rkyv::Infallible).unwrap(); 
+                    let res = sender.send( deserialized );
+                    if let Err(e) = res { 
+                        panic!("Failed to send on an unbounded channel: {0:?}", e);
+                    }
+                } 
+            )
+        );
+
+        // Start a client
+        let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+        let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+        println!("client is at {:?}", client.local_addr());
+        // client.connect(&server_addr).await.unwrap();
+
+        // Send the archive
+        let res = client.send_to(&data, &server_addr).await;
+        println!("{:?}", res);
+
+        // Extract a message back out
+        let deserialized = receiver.recv().await.unwrap();
+
+        // Make sure we only get ONE message back out.
+        timeout(Duration::from_secs(4), receiver.recv()).await.expect_err("Only one message should be sent in this test.");
+        
+        // Validate the way the sequencer parsed the message.
+        assert_eq!(deserialized.app_id, input.app_id);
+        assert_eq!(deserialized.instance_id, input.instance_id);
+        assert_eq!(deserialized.cluster_id, input.cluster_id);
+        assert_eq!(deserialized.app_sequence_number, input.app_sequence_number);
+
+        let deserialized_message = String::from_utf8_lossy(&deserialized.payload); 
+
+        assert_eq!(example_message, deserialized_message);
+    }
+    
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_counter() {
+        use rkyv::Deserialize;
+        use std::time::Duration;
+        use std::sync::atomic::{Ordering, AtomicU64};
+        use std::sync::Arc;
+
+        // Prevent tests from interfering with eachother over the localhost connection.
+        // This should implicitly drop when the test ends.
+        let _guard = IO_TEST_PERMISSIONS.lock().await;
+
+        // Start a server
+        let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
+        let inbound_server = InboundServer::new(server_addr.port());
+
+
+        let last_counter = Arc::new(AtomicU64::new(0) );
+        let last_counter_ref = last_counter.clone();
+
+        // Initialize the sequencer's polling loop.
+        let _server_handle = tokio::spawn(
+            inbound_server.start( 
+            #[inline(always)]
+                move |message| {
+                    let deserialized: SequencerMessage = message.get_ref().deserialize(&mut rkyv::Infallible).unwrap();
+                    //This should be after the sequencer put a counter on it. 
+                    let counter = deserialized.sequence_number;
+                    assert!(counter > last_counter_ref.load(Ordering::Relaxed));
+                    last_counter_ref.store(counter, Ordering::Relaxed)
                 }
-            } 
-        )
-    );
+            )
+        );
 
-    // Start a client
-    let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-    let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-    println!("client is at {:?}", client.local_addr());
-    // client.connect(&server_addr).await.unwrap();
+        // Send some messages.
+        const NUM_TEST_SENDERS: usize = 20; 
+        const NUM_MESSAGE_TEST: usize = 10; 
+        
+        for app_id in 0..NUM_TEST_SENDERS { 
+            for i in 0..NUM_MESSAGE_TEST {
+                // Dummy message for testing. 
+                let example_message = format!("Hello, world, number {}!", i);
+                let payload = example_message.as_bytes().to_vec();
+                // Build an archive
+                let input = SequencerMessage::new(app_id as u32, 1, 2, i as u64, payload);
+                let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
 
-    // Send the archive
-    let res = client.send_to(&data, &server_addr).await;
-    println!("{:?}", res);
+                // Start a client
+                let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+                // client.connect(&server_addr).await.unwrap();
 
-    // Extract a message back out
-    let deserialized = receiver.recv().await.unwrap();
-
-    // Make sure we only get ONE message back out.
-    timeout(Duration::from_secs(4), receiver.recv()).await.expect_err("Only one message should be sent in this test.");
-    
-    // Validate the way the sequencer parsed the message.
-    assert_eq!(deserialized.app_id, input.app_id);
-    assert_eq!(deserialized.instance_id, input.instance_id);
-    assert_eq!(deserialized.cluster_id, input.cluster_id);
-    assert_eq!(deserialized.app_sequence_number, input.app_sequence_number);
-
-    let deserialized_message = String::from_utf8_lossy(&deserialized.payload); 
-
-    assert_eq!(example_message, deserialized_message);
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn test_counter() {
-    use rkyv::Deserialize;
-    use std::time::Duration;
-    use std::sync::atomic::{Ordering, AtomicU64};
-    use std::sync::Arc;
-
-    // Start a server
-    let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-    let inbound_server = InboundServer::new(server_addr.port());
-
-
-    let last_counter = Arc::new(AtomicU64::new(0) );
-    let last_counter_ref = last_counter.clone();
-
-    // Initialize the sequencer's polling loop.
-    let _server_handle = tokio::spawn(
-        inbound_server.start( 
-        #[inline(always)]
-            move |message| {
-                let deserialized: SequencerMessage = message.get_ref().deserialize(&mut rkyv::Infallible).unwrap();
-                //This should be after the sequencer put a counter on it. 
-                let counter = deserialized.sequence_number;
-                assert!(counter > last_counter_ref.load(Ordering::Relaxed));
-                last_counter_ref.store(counter, Ordering::Relaxed)
+                // Send the archive
+                client.send_to(&data, &server_addr).await.expect("Failed to send");
             }
-        )
-    );
-
-    // Send some messages.
-    const NUM_TEST_SENDERS: usize = 20; 
-    const NUM_MESSAGE_TEST: usize = 10; 
-    
-    for app_id in 0..NUM_TEST_SENDERS { 
-        for i in 0..NUM_MESSAGE_TEST {
-            // Dummy message for testing. 
-            let example_message = format!("Hello, world, number {}!", i);
-            let payload = example_message.as_bytes().to_vec();
-            // Build an archive
-            let input = SequencerMessage::new(app_id as u32, 1, 2, i as u64, payload);
-            let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
-
-            // Start a client
-            let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-            let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-            // client.connect(&server_addr).await.unwrap();
-
-            // Send the archive
-            client.send_to(&data, &server_addr).await.expect("Failed to send");
         }
-    }
-    //Give the server a moment to catch up
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    //Let's see if the counter is valid...
-    assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64);
+        //Give the server a moment to catch up
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        //Let's see if the counter is valid...
+        assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64);
 
 
-    // Now send it some garbage. It will have seen all of these app-sequence-numbers before
-    for app_id in 0..NUM_TEST_SENDERS { 
-        for i in 0..NUM_MESSAGE_TEST {
-            // Dummy message for testing. 
-            let example_message = format!("Hello, world, number {}!", i);
-            let payload = example_message.as_bytes().to_vec();
-            // Build an archive
-            let input = SequencerMessage::new(app_id as u32, 1, 2, i as u64, payload);
-            let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+        // Now send it some garbage. It will have seen all of these app-sequence-numbers before
+        for app_id in 0..NUM_TEST_SENDERS { 
+            for i in 0..NUM_MESSAGE_TEST {
+                // Dummy message for testing. 
+                let example_message = format!("Hello, world, number {}!", i);
+                let payload = example_message.as_bytes().to_vec();
+                // Build an archive
+                let input = SequencerMessage::new(app_id as u32, 1, 2, i as u64, payload);
+                let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
 
-            // Start a client
-            let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-            let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-            // client.connect(&server_addr).await.unwrap();
+                // Start a client
+                let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+                // client.connect(&server_addr).await.unwrap();
 
-            // Send the archive
-            client.send_to(&data, &server_addr).await.expect("Failed to send");
+                // Send the archive
+                client.send_to(&data, &server_addr).await.expect("Failed to send");
+            }
         }
+        //Give the server a moment to catch up
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        //Since it has seen all of these app sequence numbers before, the counter should not have changed.
+        assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64);
+
+        //But if we send it a new one, it should recognize it.
+        let example_message = "Foo, and also bar!";
+        let payload = example_message.as_bytes().to_vec();
+        // Build an archive
+        let input = SequencerMessage::new(1u32, 1, 2, (NUM_MESSAGE_TEST+1) as u64, payload);
+        let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+
+        // Start a client
+        let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+        let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+        // client.connect(&server_addr).await.unwrap();
+
+        // Send the archive
+        let res = client.send_to(&data, &server_addr).await;
+        res.expect("Failed to send");
+        //Give the server a moment to catch up
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        //One new valid, non-duplicate message.
+        assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 + 1);
     }
-    //Give the server a moment to catch up
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    //Since it has seen all of these app sequence numbers before, the counter should not have changed.
-    assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64);
-
-    //But if we send it a new one, it should recognize it.
-    let example_message = "Foo, and also bar!";
-    let payload = example_message.as_bytes().to_vec();
-    // Build an archive
-    let input = SequencerMessage::new(1u32, 1, 2, (NUM_MESSAGE_TEST+1) as u64, payload);
-    let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
-
-    // Start a client
-    let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-    let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-    // client.connect(&server_addr).await.unwrap();
-
-    // Send the archive
-    let res = client.send_to(&data, &server_addr).await;
-    res.expect("Failed to send");
-    //Give the server a moment to catch up
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    //One new valid, non-duplicate message.
-    assert_eq!(last_counter.load(Ordering::Relaxed), (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 + 1);
 }
