@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub type AppId = u32; 
-pub type EpochId = u32; 
+pub type AppId = u16; 
+pub type EpochId = u16; 
 pub type InstanceId = u16; 
 pub type ClusterId = u16; 
 
