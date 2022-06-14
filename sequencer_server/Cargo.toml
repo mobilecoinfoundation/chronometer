@@ -17,4 +17,6 @@ rkyv = { version = "0.7", features = ["validation", "size_32", "alloc"] }
 tokio = { version = "1.16", features = ["full", "time", "rt", "rt-multi-thread"] }
 
 [dev-dependencies]
+chrono = "0.4.19"
+criterion = "0.3"
 lazy_static = "1.4.0"

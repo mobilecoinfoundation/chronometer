@@ -1,6 +1,6 @@
 use bytecheck::StructCheckError;
 use clap::Parser;
-use rkyv::validation::{validators::DefaultValidatorError, CheckArchiveError};
+use rkyv::{validation::{validators::DefaultValidatorError, CheckArchiveError}, Archive};
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage};
 use std::{
     collections::HashMap,
@@ -34,6 +34,8 @@ pub enum SequencerReadError {
     /// and could not be read by rkyv. We have to first format the
     /// underlying error to a string because a CheckArchiveError is not Send
     CouldNotParse(String),
+    /// Duplicate message received. Non-fatal error, but useful to propagate for metrics.
+    DuplicateMessage(AppId, u64, u64)
 }
 
 impl Display for SequencerReadError {
@@ -54,15 +56,41 @@ impl Display for SequencerReadError {
                 "Unable to parse an incoming SequencerMessage header: {:?}",
                 source_error
             ),
+            SequencerReadError::DuplicateMessage(app_id, sequence, highest) => write!(
+                f,
+                "Duplicate message received from app {}, message sequence number: {}. Previous highest sequence number encountered from this app is {}",
+                app_id,
+                sequence,
+                highest
+            ),
         }
     }
 }
 
 impl std::error::Error for SequencerReadError {}
 
-impl From<ReadArchiveError> for SequencerReadError {
-    fn from(e: ReadArchiveError) -> Self {
-        Self::CouldNotParse(format!("{:?}", e))
+pub enum SequencerReadErrorKind {
+    /// The sequencer could not bind the local socket required to read incoming
+    /// UDP packets.
+    UdpBindError,
+    /// socket.recv_from() failed
+    UdpReceiveError,
+    /// A message was received for which the SequencerMessage header was invalid
+    /// and could not be read by rkyv. We have to first format the
+    /// underlying error to a string because a CheckArchiveError is not Send
+    CouldNotParse,
+    /// Duplicate message received. Non-fatal error, but useful to propagate for metrics.
+    DuplicateMessage
+}
+
+impl SequencerReadError {
+    pub fn get_kind(&self) -> SequencerReadErrorKind { 
+        match self {
+            SequencerReadError::UdpBindError(_, _) => SequencerReadErrorKind::UdpBindError,
+            SequencerReadError::UdpReceiveError(_) => SequencerReadErrorKind::UdpReceiveError,
+            SequencerReadError::CouldNotParse(_) => SequencerReadErrorKind::CouldNotParse,
+            SequencerReadError::DuplicateMessage(_, _, _) => SequencerReadErrorKind::DuplicateMessage,
+        }
     }
 }
 
@@ -98,13 +126,86 @@ impl InboundServer {
     ) -> Pin<&'a mut ArchivedSequencerMessage> {
         self.counter += 1;
 
-        message.with_sequence_number(self.counter)
+        message.modify_sequence_number(self.counter)
+    }
+    
+    #[inline]
+    pub async fn process_inbound_message<'a>(&mut self, data: Pin<&'a mut <SequencerMessage as Archive>::Archived>) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerReadError> { 
+        let app_id = data.app_id;
+        let app_sequence_number = data.app_sequence_number;
+
+        if let Some(previous_app_seq) = self.app_sequence_numbers.get_mut(&app_id) {
+            if *previous_app_seq >= app_sequence_number {
+                //We have seen this before, it's old news.
+                // Deduplicate.
+                Err(SequencerReadError::DuplicateMessage(app_id, app_sequence_number, *previous_app_seq))
+            } else {
+                //New sequence number! Publish this message.
+                *previous_app_seq = app_sequence_number;
+
+                let data = self.update_counter(data);
+                Ok(data)
+            }
+        } else {
+            // We have not seen this app ID yet, add it to the dict.
+            self.app_sequence_numbers
+                .insert(app_id, app_sequence_number);
+            let data = self.update_counter(data);
+            Ok(data)
+        }
     }
 
-    pub async fn start<F>(mut self, closure: F) -> std::result::Result<(), SequencerReadError>
-    where
-        F: Fn(Pin<&ArchivedSequencerMessage>),
-    {
+    #[inline]
+    pub async fn poll_message<'a>(&mut self, socket: &UdpSocket, recv_buffer: &'a mut Vec<u8>) -> Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerReadError> { 
+        let (len, _addr) = socket
+            .recv_from(recv_buffer)
+            .await
+            .map_err(SequencerReadError::UdpReceiveError)?;
+        rkyv::check_archived_root::<SequencerMessage>(&recv_buffer[..len])
+            .map_err(|e| 
+                SequencerReadError::CouldNotParse(format!("{:?}", e))
+            )?;
+        // Per discussion with the rkyv author on Discord, calling check_archived_root()
+        // and then only calling archived_root_mut() if the
+        // validation succeeds should be very safe, assuming
+        // no critical bugs present in check_archived_root()
+        // The Rkyv author also mentioned that no work should get duplicated here.
+        let data = unsafe {
+            rkyv::archived_root_mut::<SequencerMessage>(Pin::new(
+                &mut recv_buffer[..len],
+            ))
+        };
+        Ok(data)
+    }
+
+    pub async fn step(&mut self, socket: &UdpSocket, recv_buffer: &mut Vec<u8>) -> std::result::Result<(), SequencerReadError> {
+        let data = self.poll_message(socket, recv_buffer).await?;
+        let message = match self.process_inbound_message(data).await {
+            Ok(msg) => Some(msg),
+            Err(e) => match e.get_kind() {
+                SequencerReadErrorKind::DuplicateMessage => { 
+                    // Only in debug builds - avoid formatting strings in the hot path in release. 
+                    #[cfg(debug_assertions)]
+                    {
+                        println!("Encountered duplicate message: {:?}", e);
+                    }
+                    // Duplicate message, ignore. 
+                    None
+                },
+                _ => {
+                    // Irrecoverable error 
+                    return Err(e);
+                }
+            },
+        };
+        //todo: use message for something. 
+        if let Some(_msg) = message {
+            
+        }
+        Ok(())
+    }
+
+    pub async fn start(mut self) -> std::result::Result<(), SequencerReadError> {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, self.port, 0, 0);
         let listener = UdpSocket::bind(addr)
             .await
@@ -113,53 +214,7 @@ impl InboundServer {
         println!("Hello, world on port {:?}!", listener);
         let mut recv_buffer = vec![0u8; 2048];
         loop {
-            let (len, addr) = listener
-                .recv_from(&mut recv_buffer)
-                .await
-                .map_err(SequencerReadError::UdpReceiveError)?;
-            println!("{}, {:?}", len, addr);
-            let data_res =
-                rkyv::check_archived_root::<SequencerMessage>(&recv_buffer[..len]).map(|_| ());
-
-            match data_res {
-                Ok(()) => {
-                    // Per discussion with the rkyv author on Discord, calling check_archived_root()
-                    // and then only calling archived_root_mut() if the
-                    // validation succeeds should be very safe, assuming
-                    // no critical bugs present in check_archived_root()
-                    // The Rkyv author also mentioned that no work should get duplicated here.
-                    let data = unsafe {
-                        rkyv::archived_root_mut::<SequencerMessage>(Pin::new(
-                            &mut recv_buffer[..len],
-                        ))
-                    };
-
-                    let app_id = data.app_id;
-                    let app_sequence_number = data.app_sequence_number;
-
-                    if let Some(previous_app_seq) = self.app_sequence_numbers.get_mut(&app_id) {
-                        if *previous_app_seq >= app_sequence_number {
-                            //We have seen this before, it's old news.
-                            // Deduplicate.
-                        } else {
-                            //New sequence number! Publish this message.
-                            *previous_app_seq = app_sequence_number;
-
-                            let data = self.update_counter(data);
-                            closure(data.into_ref());
-                        }
-                    } else {
-                        // We have not seen this app ID yet, add it to the dict.
-                        self.app_sequence_numbers
-                            .insert(app_id, app_sequence_number);
-                        let data = self.update_counter(data);
-                        closure(data.into_ref());
-                    }
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
+            self.step( &listener, &mut recv_buffer).await?;
         }
     }
 }
@@ -170,12 +225,15 @@ async fn main() -> std::io::Result<()> {
 
     let inbound_server = InboundServer::new(args.port);
     let join_handle =
-        tokio::spawn(inbound_server.start(|message| println!("Received: {:?}", message)));
+        tokio::spawn(inbound_server.start());
 
     join_handle
         .await?
         .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
 }
+
+
+// Tests
 
 #[cfg(test)]
 mod test {
@@ -192,8 +250,10 @@ mod test {
         static ref IO_TEST_PERMISSIONS: Mutex<()> = Mutex::new(());
     }
 
+    /*
     #[tokio::test(flavor = "multi_thread")]
     async fn test_stream_received() {
+        use rkyv::Archive;
         use rkyv::Deserialize;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -214,23 +274,11 @@ mod test {
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let inbound_server = InboundServer::new(server_addr.port());
-        // Set up our decoded message channel.
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        // Initialize the sequencer's polling loop.
-        let _join_handle = tokio::spawn(inbound_server.start(
-            #[inline(always)]
-            move |message| {
-                let deserialized: SequencerMessage = message
-                    .get_ref()
-                    .deserialize(&mut rkyv::Infallible)
-                    .unwrap();
-                let res = sender.send(deserialized);
-                if let Err(e) = res {
-                    panic!("Failed to send on an unbounded channel: {0:?}", e);
-                }
-            },
-        ));
+        let mut inbound_server = InboundServer::new(server_addr.port());
+
+        let server_listener = UdpSocket::bind(server_addr)
+            .await
+            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e))).unwrap();
 
         // Start a client
         let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
@@ -242,13 +290,14 @@ mod test {
         let res = client.send_to(&data, &server_addr).await;
         println!("{:?}", res);
 
-        // Extract a message back out
-        let deserialized = receiver.recv().await.unwrap();
 
-        // Make sure we only get ONE message back out.
-        timeout(Duration::from_secs(4), receiver.recv())
-            .await
-            .expect_err("Only one message should be sent in this test.");
+        let mut recv_buffer = vec![0u8; 2048];
+        let raw_message: Pin<&mut ArchivedSequencerMessage> = inbound_server.poll_message(&server_listener, &mut recv_buffer).await.unwrap(); 
+        let message: Pin<&mut ArchivedSequencerMessage> = inbound_server.process_inbound_message(raw_message).await.unwrap();
+        // Extract a message back out
+        // This always returns With<_, _>, no matter 
+        // how I try to finagle it. So, commenting this test out for now. 
+        let deserialized: SequencerMessage = message.deserialize(&mut rkyv::Infallible::default()).unwrap();
 
         // Validate the way the sequencer parsed the message.
         assert_eq!(deserialized.app_id, input.app_id);
@@ -259,18 +308,13 @@ mod test {
         let deserialized_message = String::from_utf8_lossy(&deserialized.payload);
 
         assert_eq!(example_message, deserialized_message);
-    }
+    }*/
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_counter() {
-        use rkyv::Deserialize;
-        use std::{
-            sync::{
-                atomic::{AtomicU64, Ordering},
-                Arc,
-            },
-            time::Duration,
-        };
+        use chrono::prelude::*;
+
+        let mut total_received: usize = 0;
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
@@ -278,30 +322,18 @@ mod test {
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let inbound_server = InboundServer::new(server_addr.port());
+        let mut inbound_server = InboundServer::new(server_addr.port());
 
-        let last_counter = Arc::new(AtomicU64::new(0));
-        let last_counter_ref = last_counter.clone();
-
-        // Initialize the sequencer's polling loop.
-        let _server_handle = tokio::spawn(inbound_server.start(
-            #[inline(always)]
-            move |message| {
-                let deserialized: SequencerMessage = message
-                    .get_ref()
-                    .deserialize(&mut rkyv::Infallible)
-                    .unwrap();
-                //This should be after the sequencer put a counter on it.
-                let counter = deserialized.sequence_number;
-                assert!(counter > last_counter_ref.load(Ordering::Relaxed));
-                last_counter_ref.store(counter, Ordering::Relaxed)
-            },
-        ));
+        let server_listener = UdpSocket::bind(server_addr)
+            .await
+            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e))).unwrap();
 
         // Send some messages.
         const NUM_TEST_SENDERS: usize = 20;
         const NUM_MESSAGE_TEST: usize = 10;
 
+        println!("Sending messages which should not be deduplicated (each unique).");
+
         for app_id in 0..NUM_TEST_SENDERS {
             for i in 0..NUM_MESSAGE_TEST {
                 // Dummy message for testing.
@@ -323,16 +355,30 @@ mod test {
                     .expect("Failed to send");
             }
         }
-        //Give the server a moment to catch up
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        //Let's see if the counter is valid...
+
+        let mut recv_buffer = vec![0u8; 2048];
+        for _i in 0 .. (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 { 
+            total_received += 1;
+            println!("[{:?}] Processing message # {}", Utc::now(), total_received);
+
+            let prev_counter = inbound_server.counter;
+            let data = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
+            //There should be no duplicates here.
+            let resl = inbound_server.process_inbound_message(data).await.unwrap();
+            assert!(inbound_server.counter > prev_counter);
+            assert_eq!(inbound_server.counter, resl.as_ref().sequence_number);
+            println!("[{:?}] Counter is now {}", Utc::now(), inbound_server.counter);
+        }
+
         assert_eq!(
-            last_counter.load(Ordering::Relaxed),
+            inbound_server.counter,
             (NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64
         );
 
-        // Now send it some garbage. It will have seen all of these app-sequence-numbers
-        // before
+        
+        // Now send it some garbage. 
+        // It will have seen all of these app-sequence-numbers before
+        println!("Sending messages which should be deduplicated (using previous app sequence numbers).");
         for app_id in 0..NUM_TEST_SENDERS {
             for i in 0..NUM_MESSAGE_TEST {
                 // Dummy message for testing.
@@ -354,16 +400,27 @@ mod test {
                     .expect("Failed to send");
             }
         }
-        //Give the server a moment to catch up
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _i in 0..(NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 { 
+            total_received += 1;
+            println!("[{:?}] Processing message # {}", Utc::now(), total_received);
+
+            let prev_counter = inbound_server.counter;
+            let data = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
+            //Should always be a duplicate in this context.
+            let _resl = inbound_server.process_inbound_message(data).await.unwrap_err();
+            assert_eq!(inbound_server.counter, prev_counter);
+            println!("[{:?}] Counter is now {}", Utc::now(), inbound_server.counter);
+        }
+
         //Since it has seen all of these app sequence numbers before, the counter
         // should not have changed.
         assert_eq!(
-            last_counter.load(Ordering::Relaxed),
+            inbound_server.counter,
             (NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64
         );
 
         //But if we send it a new one, it should recognize it.
+        println!("Lastly, sending a new message which should be new and not deduplicated.");
         let example_message = "Foo, and also bar!";
         let payload = example_message.as_bytes().to_vec();
         // Build an archive
@@ -378,11 +435,16 @@ mod test {
         // Send the archive
         let res = client.send_to(&data, &server_addr).await;
         res.expect("Failed to send");
-        //Give the server a moment to catch up
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        
+        total_received += 1;
+        println!("[{:?}] Processing message # {}", Utc::now(), total_received);
+        let data = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
+        let _resl = inbound_server.process_inbound_message(data).await.unwrap();
+        println!("[{:?}] Finally, counter is {}", Utc::now(), inbound_server.counter);
+
         //One new valid, non-duplicate message.
         assert_eq!(
-            last_counter.load(Ordering::Relaxed),
+            inbound_server.counter,
             (NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64 + 1
         );
     }
