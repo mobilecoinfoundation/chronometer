@@ -250,13 +250,9 @@ mod test {
         static ref IO_TEST_PERMISSIONS: Mutex<()> = Mutex::new(());
     }
 
-    /*
     #[tokio::test(flavor = "multi_thread")]
     async fn test_stream_received() {
-        use rkyv::Archive;
         use rkyv::Deserialize;
-        use std::time::Duration;
-        use tokio::time::timeout;
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
@@ -297,7 +293,7 @@ mod test {
         // Extract a message back out
         // This always returns With<_, _>, no matter 
         // how I try to finagle it. So, commenting this test out for now. 
-        let deserialized: SequencerMessage = message.deserialize(&mut rkyv::Infallible::default()).unwrap();
+        let deserialized: SequencerMessage = message.as_ref().get_ref().deserialize(&mut rkyv::Infallible::default()).unwrap();
 
         // Validate the way the sequencer parsed the message.
         assert_eq!(deserialized.app_id, input.app_id);
@@ -308,7 +304,7 @@ mod test {
         let deserialized_message = String::from_utf8_lossy(&deserialized.payload);
 
         assert_eq!(example_message, deserialized_message);
-    }*/
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_counter() {
