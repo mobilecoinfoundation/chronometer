@@ -276,7 +276,8 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    let record = record::MemMapBackend::init(path)?;
+    // TODO: Persist starting offset.
+    let record = record::MemMapBackend::init(path, 0)?;
 
     let inbound_server = InboundServer::new(args.port, record);
     let join_handle =
@@ -368,8 +369,6 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_counter() {
 
-        let mut total_received: usize = 0;
-
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
         let _guard = IO_TEST_PERMISSIONS.lock().await;
@@ -386,7 +385,7 @@ mod test {
         const NUM_TEST_SENDERS: usize = 20;
         const NUM_MESSAGE_TEST: usize = 10;
 
-        println!("Sending messages which should not be deduplicated (each unique).");
+        //println!("Sending messages which should not be deduplicated (each unique).");
 
         for app_id in 0..NUM_TEST_SENDERS {
             for i in 0..NUM_MESSAGE_TEST {
@@ -411,17 +410,14 @@ mod test {
         }
 
         let mut recv_buffer = vec![0u8; 2048];
-        for _i in 0 .. (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 { 
-            total_received += 1;
-            println!("Processing message # {}", total_received);
-
+        for _i in 0 .. (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
             let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
             //There should be no duplicates here.
             let resl = inbound_server.process_inbound_message(data).await.unwrap();
             assert!(inbound_server.counter > prev_counter);
             assert_eq!(inbound_server.counter, resl.as_ref().sequence_number);
-            println!("Counter is now {}", inbound_server.counter);
+            //println!("Counter is now {}", inbound_server.counter);
         }
 
         assert_eq!(
@@ -432,7 +428,7 @@ mod test {
         
         // Now send it some garbage. 
         // It will have seen all of these app-sequence-numbers before
-        println!("Sending messages which should be deduplicated (using previous app sequence numbers).");
+        //println!("Sending messages which should be deduplicated (using previous app sequence numbers).");
         for app_id in 0..NUM_TEST_SENDERS {
             for i in 0..NUM_MESSAGE_TEST {
                 // Dummy message for testing.
@@ -454,16 +450,13 @@ mod test {
                     .expect("Failed to send");
             }
         }
-        for _i in 0..(NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 { 
-            total_received += 1;
-            println!("Processing message # {}", total_received);
-
+        for _i in 0..(NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
             let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
             //Should always be a duplicate in this context.
             let _resl = inbound_server.process_inbound_message(data).await.unwrap_err();
             assert_eq!(inbound_server.counter, prev_counter);
-            println!("Counter is now {}", inbound_server.counter);
+            //println!("Counter is now {}", inbound_server.counter);
         }
 
         //Since it has seen all of these app sequence numbers before, the counter
@@ -474,7 +467,7 @@ mod test {
         );
 
         //But if we send it a new one, it should recognize it.
-        println!("Lastly, sending a new message which should be new and not deduplicated.");
+        //println!("Lastly, sending a new message which should be new and not deduplicated.");
         let example_message = "Foo, and also bar!";
         let payload = example_message.as_bytes().to_vec();
         // Build an archive
@@ -489,12 +482,11 @@ mod test {
         // Send the archive
         let res = client.send_to(&data, &server_addr).await;
         res.expect("Failed to send");
-        
-        total_received += 1;
-        println!("Processing message # {}", total_received);
+
+        //println!("Processing message # {}", total_received);
         let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
         let _resl = inbound_server.process_inbound_message(data).await.unwrap();
-        println!("Finally, counter is {}", inbound_server.counter);
+        //println!("Finally, counter is {}", inbound_server.counter);
 
         //One new valid, non-duplicate message.
         assert_eq!(
@@ -554,17 +546,17 @@ mod test {
 
     fn msgrecord_to_messages<T: AsRef<[u8]>>(data: T) -> Vec<Vec<u8>> { 
         let mut messages: Vec<Vec<u8>> = Vec::default();
-        let mut cursor = 0;  
+        let mut cursor = 0 as usize;  
         while cursor < data.as_ref().len() { 
-            let mut length_tag_bytes = [0u8; 8];
-            length_tag_bytes.copy_from_slice(&data.as_ref()[cursor..cursor+8]);
-            let length = u64::from_le_bytes(length_tag_bytes) as usize;
+            let mut length_tag_bytes = [0u8; record::LENGTH_TAG_LEN];
+            length_tag_bytes.copy_from_slice(&data.as_ref()[cursor..cursor+record::LENGTH_TAG_LEN]);
+            let length = record::LengthTag::from_le_bytes(length_tag_bytes) as usize;
             if length == 0 { 
                 break
             }
-            assert!( cursor + (length) < data.as_ref().len() );
+            assert!( cursor + record::LENGTH_TAG_LEN + length <= data.as_ref().len() );
 
-            cursor += 8;
+            cursor += record::LENGTH_TAG_LEN;
             messages.push((&data.as_ref()[cursor..cursor+length]).to_vec());
             cursor += length;
         }
@@ -613,11 +605,9 @@ mod test {
             std::fs::remove_file(path).unwrap();
         }
 
-        let record = MemMapBackend::init(&path).unwrap();
+        let record = MemMapBackend::init(&path, 0).unwrap();
         let record = test_record_emit(NUM_TESTS as u64, 0, record).await.unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
 
-        assert_eq!(metadata.len(), record.record_len());
         // Make sure the file handle gets dropped so we can open it again without clobbering anything.
         drop(record);
 
@@ -664,13 +654,13 @@ mod test {
         if path.exists() { 
             std::fs::remove_file(path).unwrap();
         }
-
+        #[allow(unused_assignments)]
+        let mut last_offset = 0;
         { 
-            let record = MemMapBackend::init(&path).unwrap();
+            let record = MemMapBackend::init(&path, 0).unwrap();
             let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).await.unwrap();
-            let metadata = std::fs::metadata(&path).unwrap();
-    
-            assert_eq!(metadata.len(), record.record_len());
+
+            last_offset = record.record_len();
             // Make sure the file handle gets dropped so we can open it again without clobbering anything.
             drop(record);
     
@@ -699,14 +689,11 @@ mod test {
         const NUM_TESTS_SECOND: usize = 72; 
 
         { 
-            let record = MemMapBackend::init(&path).unwrap();
+            let record = MemMapBackend::init(&path, last_offset).unwrap();
             let record = test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record).await.unwrap();
-            let metadata = std::fs::metadata(&path).unwrap();
-    
-            assert_eq!(metadata.len(), record.record_len());
+
             // Make sure the file handle gets dropped so we can open it again without clobbering anything.
             drop(record);
-    
     
             let mut file = std::fs::File::open(&path).unwrap();
             let mut data = Vec::default();
