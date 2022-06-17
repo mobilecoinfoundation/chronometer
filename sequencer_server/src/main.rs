@@ -505,13 +505,14 @@ mod test {
 
     // Generates a message record for testing purposes.
     // This is used as the first half of a couple of other tests.
-    async fn test_record_emit<T: MessageRecordBackend>(num_tests: u64, record: T) -> Result<T, Box<dyn std::error::Error>> {
+    async fn test_record_emit<T: MessageRecordBackend>(num_tests: u64, counter_start: u64, record: T) -> Result<T, Box<dyn std::error::Error>> {
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
         let mut server = InboundServer::new(server_addr.port(), record);
+        server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
             .await
@@ -521,10 +522,10 @@ mod test {
 
         for i in 0..num_tests {
                 // Dummy message for testing.
-                let example_message = format!("Hello, world! This is message #{}", i);
+                let example_message = format!("Hello, world! This is message #{}", i+counter_start);
                 let payload = example_message.as_bytes().to_vec();
                 // Build an archive
-                let mut input = SequencerMessage::new(1 as AppId, 1, 2, i, payload);
+                let mut input = SequencerMessage::new(1 as AppId, 1, 2, counter_start+i, payload);
                 // Give it some stupid garbage as its sequence number, so we can be sure the server overwrites it.
                 input.sequence_number = u64::MAX;
                 //Serialize.
@@ -572,13 +573,16 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn record_vec() {
+        const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock().await;
-        let record = test_record_emit(32, VecBackend{inner: Vec::default()}).await.unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, VecBackend{inner: Vec::default()}).await.unwrap();
         drop(_guard);
         println!("File is {} bytes.", record.inner.len());
 
         let messages: Vec<Vec<u8>> = msgrecord_to_messages(&record.inner);
 
+        assert_eq!(messages.len(), NUM_TESTS);
+        
         for (i, message) in messages.iter().enumerate() { 
             println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
             let converted = String::from_utf8_lossy(&message); 
@@ -591,9 +595,10 @@ mod test {
             assert_eq!(deserialized.app_sequence_number, i as u64);
         }
     }
-/*
+
     #[tokio::test(flavor = "multi_thread")]
     async fn record_mmap_file() {
+        const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock().await;
 
         //Ignore if it already exists.
@@ -609,9 +614,8 @@ mod test {
         }
 
         let record = MemMapBackend::init(&path).unwrap();
-        let record = test_record_emit(32, record).await.unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, record).await.unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
-        println!("File is {:?}", metadata);
 
         assert_eq!(metadata.len(), record.record_len());
         // Make sure the file handle gets dropped so we can open it again without clobbering anything.
@@ -624,6 +628,8 @@ mod test {
         drop(file);
 
         let messages = msgrecord_to_messages(&data);
+
+        assert_eq!(messages.len(), NUM_TESTS);
 
         for (i, message) in messages.iter().enumerate() { 
             println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
@@ -639,5 +645,92 @@ mod test {
         //Clean up 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
-    }*/
+    }
+
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multiple_sessions_mmap_file() {
+        const NUM_TESTS_INITIAL: usize = 32; 
+        let _guard = IO_TEST_PERMISSIONS.lock().await;
+
+        //Ignore if it already exists.
+        #[allow(unused_must_use)] { 
+            std::fs::create_dir(Path::new("test_output/"));
+        }
+
+        let path = Path::new("test_output/messagebus");
+
+        // If a test failed, clean up after it.
+        if path.exists() { 
+            std::fs::remove_file(path).unwrap();
+        }
+
+        { 
+            let record = MemMapBackend::init(&path).unwrap();
+            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).await.unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+    
+            assert_eq!(metadata.len(), record.record_len());
+            // Make sure the file handle gets dropped so we can open it again without clobbering anything.
+            drop(record);
+    
+    
+            let mut file = std::fs::File::open(&path).unwrap();
+            let mut data = Vec::default();
+            file.read_to_end(&mut data).unwrap();
+            drop(file);
+    
+            let messages = msgrecord_to_messages(&data);
+    
+            assert_eq!(messages.len(), NUM_TESTS_INITIAL);
+    
+            for (i, message) in messages.iter().enumerate() { 
+                println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
+                let converted = String::from_utf8_lossy(&message); 
+                let expected_message = format!("Hello, world! This is message #{}", i);
+                assert!(converted.contains(&expected_message));
+    
+                let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+                // App should have overwritten the sequence number gracefully.
+                assert_eq!(deserialized.sequence_number, (i as u64)+1);
+                assert_eq!(deserialized.app_sequence_number, i as u64);
+            }
+        }
+        const NUM_TESTS_SECOND: usize = 72; 
+
+        { 
+            let record = MemMapBackend::init(&path).unwrap();
+            let record = test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record).await.unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+    
+            assert_eq!(metadata.len(), record.record_len());
+            // Make sure the file handle gets dropped so we can open it again without clobbering anything.
+            drop(record);
+    
+    
+            let mut file = std::fs::File::open(&path).unwrap();
+            let mut data = Vec::default();
+            file.read_to_end(&mut data).unwrap();
+            drop(file);
+    
+            let messages = msgrecord_to_messages(&data);
+    
+            assert_eq!(messages.len(), NUM_TESTS_INITIAL+NUM_TESTS_SECOND);
+    
+            for (i, message) in messages.iter().enumerate() { 
+                println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
+                let converted = String::from_utf8_lossy(&message); 
+                let expected_message = format!("Hello, world! This is message #{}", i);
+                assert!(converted.contains(&expected_message));
+    
+                let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+                // App should have overwritten the sequence number gracefully.
+                assert_eq!(deserialized.sequence_number, (i as u64)+1);
+                assert_eq!(deserialized.app_sequence_number, i as u64);
+            }
+        }
+        //Clean up 
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(Path::new("test_output/")).unwrap();
+    }
 }

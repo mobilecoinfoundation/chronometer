@@ -68,13 +68,15 @@ impl MessageRecordBackend for MemMapBackend {
     fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Self::WriteMsgFuture {
         // Length of message payload to append.
         let message_len = message.as_ref().len() as u64; 
+        const LENGTH_PREFIX_LEN: usize = std::mem::size_of::<u64>(); 
         // Total new bytes to append.
-        let additional_len: u64 = std::mem::size_of::<u64>() as u64 + message_len;
+        let additional_len: u64 = LENGTH_PREFIX_LEN as u64 + message_len;
         // End of length prefix, start of message payload.
-        let message_start = self.current_offset + std::mem::size_of::<u64>() as u64;
+        //let message_start = self.current_offset + LENGTH_PREFIX_LEN as u64;
         // Length prefix bytes.
         // TODO: Discuss with team - are we sure we want little-endian? 
         let len_bytes = (message.as_ref().len() as u64).to_le_bytes();
+        let full_len = LENGTH_PREFIX_LEN + message_len as usize;
         // How long will the file need to be to contain this new information?
         let new_file_end = self.current_offset + additional_len;
 
@@ -87,6 +89,7 @@ impl MessageRecordBackend for MemMapBackend {
         let mut options = MmapOptions::default();
         // Append - start at the end of the file. 
         options.offset(self.current_offset);
+        options.len(new_file_end as usize);
 
         // There is, apparently, no such thing as a "safe" memory map
         // since, at an OS level, not much safety is built in -
@@ -106,16 +109,21 @@ impl MessageRecordBackend for MemMapBackend {
                 return future::err(e);
             }
         }*/
+ 
+        // Current range of the memory map right now appears to be offset..len - this affects how the slice works. 
+        //mmap[self.current_offset as usize .. message_start as usize]
+        //    .copy_from_slice(&len_bytes);
+        //mmap[message_start as usize .. new_file_end as usize]
+        //    .copy_from_slice(message.as_ref());
 
-        // Push our length prefix. 
-        mmap[self.current_offset as usize .. message_start as usize]
+        // Push our length prefix.
+        mmap[0 .. LENGTH_PREFIX_LEN]
             .copy_from_slice(&len_bytes);
-
         // Push our message.
-        mmap[message_start as usize .. new_file_end as usize]
+        mmap[LENGTH_PREFIX_LEN .. full_len]
             .copy_from_slice(message.as_ref());
         
-        match mmap.flush_range(self.current_offset as usize, additional_len as usize) {
+        match mmap.flush_range(0, full_len) {
             Ok(_) => {
                 // Update our current offset counter.
                 self.current_offset = new_file_end;
