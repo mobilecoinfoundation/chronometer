@@ -7,10 +7,9 @@ use std::{
     collections::HashMap,
     fmt::Display,
     io::ErrorKind as IoErrorKind,
-    net::{Ipv6Addr, SocketAddrV6},
-    pin::Pin, path::PathBuf,
+    net::{Ipv6Addr, SocketAddrV6, UdpSocket},
+    pin::Pin, path::PathBuf, sync::atomic::{AtomicU64}, thread,
 };
-use tokio::{self, net::UdpSocket};
 
 pub mod record;
 
@@ -26,8 +25,12 @@ struct Args {
 }
 
 pub type ReadArchiveError = CheckArchiveError<StructCheckError, DefaultValidatorError>;
+
+/// How many bytes have been published to the message bus (during this epoch) in total?
+pub static CURRENT_OFFSET: AtomicU64 = AtomicU64::new(0u64); 
+
 #[derive(Debug)]
-pub enum SequencerReadError {
+pub enum SequencerError {
     /// A message was received for which the SequencerMessage header was invalid
     /// and could not be read by rkyv. We have to first format the
     /// underlying error to a string because a CheckArchiveError is not Send
@@ -41,45 +44,52 @@ pub enum SequencerReadError {
     UdpReceiveError(std::io::Error),
     /// Unable to write a received message to our record file. 
     WriteToFile(std::io::Error),
+    /// Failed to change the properties of a UDPSocket.
+    SocketChangeFailed(std::io::Error), 
 }
 
-impl Display for SequencerReadError {
+impl Display for SequencerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SequencerReadError::CouldNotParse(source_error) => write!(
+            SequencerError::CouldNotParse(source_error) => write!(
                 f,
                 "Unable to parse an incoming SequencerMessage header: {:?}",
                 source_error
             ),
-            SequencerReadError::DuplicateMessage(app_id, sequence, highest) => write!(
+            SequencerError::DuplicateMessage(app_id, sequence, highest) => write!(
                 f,
                 "Duplicate message received from app {}, message sequence number: {}. Previous highest sequence number encountered from this app is {}",
                 app_id,
                 sequence,
                 highest
             ),
-            SequencerReadError::UdpBindError(port, source_error) => write!(
+            SequencerError::UdpBindError(port, source_error) => write!(
                 f,
                 "Could not bind a UDP socket on port {}: {:?}",
                 port, source_error
             ),
-            SequencerReadError::UdpReceiveError(source_error) => write!(
+            SequencerError::UdpReceiveError(source_error) => write!(
                 f,
                 "IO error while reading from UDP socket: {:?}",
                 source_error
             ),
-            SequencerReadError::WriteToFile(source_error) => write!(
+            SequencerError::WriteToFile(source_error) => write!(
                 f,
                 "IO error, unable to write message to our record file: {:?}",
+                source_error
+            ),
+            SequencerError::SocketChangeFailed(source_error) => write!(
+                f,
+                "Could not change the configuration of a UDP socket: {:?}",
                 source_error
             ),
         }
     }
 }
 
-impl std::error::Error for SequencerReadError {}
+impl std::error::Error for SequencerError {}
 
-pub enum SequencerReadErrorKind {
+pub enum SequencerErrorKind {
     /// A message was received for which the SequencerMessage header was invalid
     /// and could not be read by rkyv. We have to first format the
     /// underlying error to a string because a CheckArchiveError is not Send
@@ -93,16 +103,19 @@ pub enum SequencerReadErrorKind {
     UdpReceiveError,
     /// Unable to write a received message to our record file. 
     WriteToFile,
+    /// Failed to change the properties of a UDPSocket.
+    SocketChangeFailed,
 }
 
-impl SequencerReadError {
-    pub fn get_kind(&self) -> SequencerReadErrorKind { 
+impl SequencerError {
+    pub fn get_kind(&self) -> SequencerErrorKind { 
         match self {
-            SequencerReadError::CouldNotParse(_) => SequencerReadErrorKind::CouldNotParse,
-            SequencerReadError::DuplicateMessage(_, _, _) => SequencerReadErrorKind::DuplicateMessage,
-            SequencerReadError::UdpBindError(_, _) => SequencerReadErrorKind::UdpBindError,
-            SequencerReadError::UdpReceiveError(_) => SequencerReadErrorKind::UdpReceiveError,
-            SequencerReadError::WriteToFile(_) => SequencerReadErrorKind::WriteToFile,
+            SequencerError::CouldNotParse(_) => SequencerErrorKind::CouldNotParse,
+            SequencerError::DuplicateMessage(_, _, _) => SequencerErrorKind::DuplicateMessage,
+            SequencerError::UdpBindError(_, _) => SequencerErrorKind::UdpBindError,
+            SequencerError::UdpReceiveError(_) => SequencerErrorKind::UdpReceiveError,
+            SequencerError::WriteToFile(_) => SequencerErrorKind::WriteToFile,
+            SequencerError::SocketChangeFailed(_) => SequencerErrorKind::SocketChangeFailed,
         }
     }
 }
@@ -146,7 +159,7 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
     }
     
     #[inline]
-    pub async fn process_inbound_message<'a>(&mut self, data: Pin<&'a mut <SequencerMessage as Archive>::Archived>) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerReadError> { 
+    pub fn process_inbound_message<'a>(&mut self, data: Pin<&'a mut <SequencerMessage as Archive>::Archived>) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerError> { 
         let app_id = data.app_id;
         let app_sequence_number = data.app_sequence_number;
 
@@ -154,7 +167,7 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
             if *previous_app_seq >= app_sequence_number {
                 //We have seen this before, it's old news.
                 // Deduplicate.
-                Err(SequencerReadError::DuplicateMessage(app_id, app_sequence_number, *previous_app_seq))
+                Err(SequencerError::DuplicateMessage(app_id, app_sequence_number, *previous_app_seq))
             } else {
                 //New sequence number! Publish this message.
                 *previous_app_seq = app_sequence_number;
@@ -174,20 +187,19 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
 
     /// Write the provided message to our record file. 
     #[inline]
-    pub async fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> std::result::Result<(), SequencerReadError> {
-        self.record.write_message(message).await
-            .map_err(|e| SequencerReadError::WriteToFile(e))
+    pub fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> std::result::Result<(), SequencerError> {
+        self.record.write_message(message)
+            .map_err(|e| SequencerError::WriteToFile(e))
     }
 
     #[inline]
-    pub async fn poll_message<'a>(&mut self, socket: &UdpSocket, recv_buffer: &'a mut Vec<u8>) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64), SequencerReadError> { 
+    pub fn poll_message<'a>(&mut self, socket: &UdpSocket, recv_buffer: &'a mut Vec<u8>) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64), SequencerError> { 
         let (message_len, _addr) = socket
             .recv_from(recv_buffer)
-            .await
-            .map_err(SequencerReadError::UdpReceiveError)?;
+            .map_err(SequencerError::UdpReceiveError)?;
         rkyv::check_archived_root::<SequencerMessage>(&recv_buffer[..message_len])
             .map_err(|e| 
-                SequencerReadError::CouldNotParse(format!("{:?}", e))
+                SequencerError::CouldNotParse(format!("{:?}", e))
             )?;
         // Per discussion with the rkyv author on Discord, calling check_archived_root()
         // and then only calling archived_root_mut() if the
@@ -203,12 +215,12 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
     }
 
     #[inline]
-    pub async fn step(&mut self, socket: &UdpSocket, recv_buffer: &mut Vec<u8>) -> std::result::Result<(), SequencerReadError> {
-        let (data, message_len) = self.poll_message(socket, recv_buffer).await?;
-        let message_maybe = match self.process_inbound_message(data).await {
+    pub fn step(&mut self, socket: &UdpSocket, recv_buffer: &mut Vec<u8>) -> std::result::Result<(), SequencerError> {
+        let (data, message_len) = self.poll_message(socket, recv_buffer)?;
+        let message_maybe = match self.process_inbound_message(data) {
             Ok(msg) => Some(msg),
             Err(e) => match e.get_kind() {
-                SequencerReadErrorKind::DuplicateMessage => { 
+                SequencerErrorKind::DuplicateMessage => { 
                     // Only in debug builds - avoid formatting strings in the hot path in release. 
                     #[cfg(debug_assertions)]
                     {
@@ -226,22 +238,23 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
         if message_maybe.is_some() {
             drop(message_maybe);
             if message_len > 0 { 
-                self.write_message(&recv_buffer[0..message_len as usize]).await?;
+                self.write_message(&recv_buffer[0..message_len as usize])?;
             }
         }
         Ok(())
     }
 
-    pub async fn start(mut self) -> std::result::Result<(), SequencerReadError> {
+    pub fn start(mut self) -> std::result::Result<(), SequencerError> {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, self.port, 0, 0);
-        let listener = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e)))?;
+        let listener = UdpSocket::bind(&addr)
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))?;
+        listener.set_nonblocking(false)
+            .map_err(|e| SequencerError::SocketChangeFailed(e))?;
 
-        println!("Hello, world on port {:?}!", listener);
+        println!("Launching server, bound to socket {:?}", &addr);
         let mut recv_buffer = vec![0u8; 2048];
         loop {
-            self.step( &listener, &mut recv_buffer).await?;
+            self.step( &listener, &mut recv_buffer)?;
         }
     }
 
@@ -253,8 +266,7 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     #[cfg(debug_assertions)]
@@ -280,12 +292,7 @@ async fn main() -> std::io::Result<()> {
     let record = record::MemMapBackend::init(path, 0)?;
 
     let inbound_server = InboundServer::new(args.port, record);
-    let join_handle =
-        tokio::spawn(inbound_server.start());
-
-    join_handle
-        .await?
-        .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
+    inbound_server.start().map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
 }
 
 
@@ -293,13 +300,12 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use std::{io::Read, path::Path};
+    use std::{io::Read, path::Path, sync::Mutex};
 
     use crate::record::{test_util::{DummyBackend, VecBackend}, MemMapBackend};
 
     use super::*;
     use lazy_static::lazy_static;
-    use tokio::sync::Mutex;
 
     // Any localhost-related network tests will interfere with eachother if you use
     // the cargo test command, which is multithreaded by default.
@@ -310,13 +316,13 @@ mod test {
         static ref IO_TEST_PERMISSIONS: Mutex<()> = Mutex::new(());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_stream_received() {
+    #[test]
+    fn test_stream_received() {
         use rkyv::Deserialize;
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
-        let _guard = IO_TEST_PERMISSIONS.lock().await;
+        let _guard = IO_TEST_PERMISSIONS.lock();
 
         // Dummy message for testing.
         let example_message = "Hello, world!";
@@ -333,23 +339,23 @@ mod test {
         let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend{});
 
         let server_listener = UdpSocket::bind(server_addr)
-            .await
-            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e))).unwrap();
+            
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
 
         // Start a client
         let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-        let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
+        let client = UdpSocket::bind(&client_addr).unwrap();
         println!("client is at {:?}", client.local_addr());
-        // client.connect(&server_addr).await.unwrap();
+        // client.connect(&server_addr).unwrap();
 
         // Send the archive
-        let res = client.send_to(&data, &server_addr).await;
+        let res = client.send_to(&data, &server_addr);
         println!("{:?}", res);
 
 
         let mut recv_buffer = vec![0u8; 2048];
-        let (raw_message, _len): (Pin<&mut ArchivedSequencerMessage>, u64) = inbound_server.poll_message(&server_listener, &mut recv_buffer).await.unwrap(); 
-        let message: Pin<&mut ArchivedSequencerMessage> = inbound_server.process_inbound_message(raw_message).await.unwrap();
+        let (raw_message, _len): (Pin<&mut ArchivedSequencerMessage>, u64) = inbound_server.poll_message(&server_listener, &mut recv_buffer).unwrap(); 
+        let message: Pin<&mut ArchivedSequencerMessage> = inbound_server.process_inbound_message(raw_message).unwrap();
         // Extract a message back out
         // This always returns With<_, _>, no matter 
         // how I try to finagle it. So, commenting this test out for now. 
@@ -366,20 +372,20 @@ mod test {
         assert_eq!(example_message, deserialized_message);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_counter() {
+    #[test]
+    fn test_counter() {
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
-        let _guard = IO_TEST_PERMISSIONS.lock().await;
+        let _guard = IO_TEST_PERMISSIONS.lock();
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
         let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend{});
 
         let server_listener = UdpSocket::bind(server_addr)
-            .await
-            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e))).unwrap();
+            
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
 
         // Send some messages.
         const NUM_TEST_SENDERS: usize = 20;
@@ -398,13 +404,13 @@ mod test {
 
                 // Start a client
                 let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-                // client.connect(&server_addr).await.unwrap();
+                let client = UdpSocket::bind(&client_addr).unwrap();
+                // client.connect(&server_addr).unwrap();
 
                 // Send the archive
                 client
                     .send_to(&data, &server_addr)
-                    .await
+                    
                     .expect("Failed to send");
             }
         }
@@ -412,9 +418,9 @@ mod test {
         let mut recv_buffer = vec![0u8; 2048];
         for _i in 0 .. (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
+            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
             //There should be no duplicates here.
-            let resl = inbound_server.process_inbound_message(data).await.unwrap();
+            let resl = inbound_server.process_inbound_message(data).unwrap();
             assert!(inbound_server.counter > prev_counter);
             assert_eq!(inbound_server.counter, resl.as_ref().sequence_number);
             //println!("Counter is now {}", inbound_server.counter);
@@ -440,21 +446,21 @@ mod test {
 
                 // Start a client
                 let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-                // client.connect(&server_addr).await.unwrap();
+                let client = UdpSocket::bind(&client_addr).unwrap();
+                // client.connect(&server_addr).unwrap();
 
                 // Send the archive
                 client
                     .send_to(&data, &server_addr)
-                    .await
+                    
                     .expect("Failed to send");
             }
         }
         for _i in 0..(NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
+            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
             //Should always be a duplicate in this context.
-            let _resl = inbound_server.process_inbound_message(data).await.unwrap_err();
+            let _resl = inbound_server.process_inbound_message(data).unwrap_err();
             assert_eq!(inbound_server.counter, prev_counter);
             //println!("Counter is now {}", inbound_server.counter);
         }
@@ -476,16 +482,16 @@ mod test {
 
         // Start a client
         let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-        let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-        // client.connect(&server_addr).await.unwrap();
+        let client = UdpSocket::bind(&client_addr).unwrap();
+        // client.connect(&server_addr).unwrap();
 
         // Send the archive
-        let res = client.send_to(&data, &server_addr).await;
+        let res = client.send_to(&data, &server_addr);
         res.expect("Failed to send");
 
         //println!("Processing message # {}", total_received);
-        let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).await.unwrap();
-        let _resl = inbound_server.process_inbound_message(data).await.unwrap();
+        let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
+        let _resl = inbound_server.process_inbound_message(data).unwrap();
         //println!("Finally, counter is {}", inbound_server.counter);
 
         //One new valid, non-duplicate message.
@@ -497,7 +503,7 @@ mod test {
 
     // Generates a message record for testing purposes.
     // This is used as the first half of a couple of other tests.
-    async fn test_record_emit<T: MessageRecordBackend>(num_tests: u64, counter_start: u64, record: T) -> Result<T, Box<dyn std::error::Error>> {
+    fn test_record_emit<T: MessageRecordBackend>(num_tests: u64, counter_start: u64, record: T) -> Result<T, Box<dyn std::error::Error>> {
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
 
@@ -507,8 +513,8 @@ mod test {
         server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
-            .await
-            .map_err(|e| SequencerReadError::CouldNotParse(format!("{:?}", e))).unwrap();
+            
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
 
         // Send a message from a client.
 
@@ -525,20 +531,20 @@ mod test {
 
                 // Start a client
                 let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let client = tokio::net::UdpSocket::bind(&client_addr).await.unwrap();
-                // client.connect(&server_addr).await.unwrap();
+                let client = UdpSocket::bind(&client_addr).unwrap();
+                // client.connect(&server_addr).unwrap();
 
                 // Send the archive
                 client
                     .send_to(&data, &server_addr)
-                    .await
+                    
                     .expect("Failed to send");
         }
 
         // Receive. 
         let mut recv_buffer = vec![0u8; 2048];
         for _ in 0..num_tests {
-            server.step(&server_listener, &mut recv_buffer).await.unwrap();
+            server.step(&server_listener, &mut recv_buffer).unwrap();
         }
         
         Ok(server.into_record())
@@ -563,11 +569,11 @@ mod test {
         messages
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn record_vec() {
+    #[test]
+    fn record_vec() {
         const NUM_TESTS: usize = 32; 
-        let _guard = IO_TEST_PERMISSIONS.lock().await;
-        let record = test_record_emit(NUM_TESTS as u64, 0, VecBackend{inner: Vec::default()}).await.unwrap();
+        let _guard = IO_TEST_PERMISSIONS.lock();
+        let record = test_record_emit(NUM_TESTS as u64, 0, VecBackend{inner: Vec::default()}).unwrap();
         drop(_guard);
         println!("File is {} bytes.", record.inner.len());
 
@@ -588,10 +594,10 @@ mod test {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn record_mmap_file() {
+    #[test]
+    fn record_mmap_file() {
         const NUM_TESTS: usize = 32; 
-        let _guard = IO_TEST_PERMISSIONS.lock().await;
+        let _guard = IO_TEST_PERMISSIONS.lock();
 
         //Ignore if it already exists.
         #[allow(unused_must_use)] { 
@@ -606,7 +612,7 @@ mod test {
         }
 
         let record = MemMapBackend::init(&path, 0).unwrap();
-        let record = test_record_emit(NUM_TESTS as u64, 0, record).await.unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, record).unwrap();
 
         // Make sure the file handle gets dropped so we can open it again without clobbering anything.
         drop(record);
@@ -638,10 +644,10 @@ mod test {
     }
 
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn multiple_sessions_mmap_file() {
+    #[test]
+    fn multiple_sessions_mmap_file() {
         const NUM_TESTS_INITIAL: usize = 32; 
-        let _guard = IO_TEST_PERMISSIONS.lock().await;
+        let _guard = IO_TEST_PERMISSIONS.lock();
 
         //Ignore if it already exists.
         #[allow(unused_must_use)] { 
@@ -658,7 +664,7 @@ mod test {
         let mut last_offset = 0;
         { 
             let record = MemMapBackend::init(&path, 0).unwrap();
-            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).await.unwrap();
+            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).unwrap();
 
             last_offset = record.record_len();
             // Make sure the file handle gets dropped so we can open it again without clobbering anything.
@@ -690,7 +696,7 @@ mod test {
 
         { 
             let record = MemMapBackend::init(&path, last_offset).unwrap();
-            let record = test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record).await.unwrap();
+            let record = test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record).unwrap();
 
             // Make sure the file handle gets dropped so we can open it again without clobbering anything.
             drop(record);

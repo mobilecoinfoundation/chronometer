@@ -2,9 +2,8 @@
 //! message bus. The sequencer's message history is split into two memory-mapped
 //! ring buffer files, one of which contains the current
 
-use std::{future::Future, path::Path, fs::{File, OpenOptions}, io::{SeekFrom, Seek, Write}};
+use std::{path::Path, fs::{File, OpenOptions}, io::{SeekFrom, Seek, Write}};
 
-use futures::future;
 use memmap2::{MmapOptions, MmapMut};
 
 pub(crate) type LengthTag = u16; 
@@ -14,10 +13,8 @@ pub(crate) const LENGTH_TAG_LEN: usize = std::mem::size_of::<LengthTag>();
 const GROW_BY: usize = 65535;
 
 pub trait MessageRecordBackend : Sized {
-    type WriteMsgFuture: Future<Output=Result<(), std::io::Error>>; 
-
     fn init<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error>; 
-    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Self::WriteMsgFuture; 
+    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error>; 
     /// How long was this file when we opened it, at the start of this run of the program? 
     fn initial_offset(&self) -> u64;
     /// How many bytes total comprise this record? 
@@ -37,7 +34,7 @@ pub struct MemMapBackend {
     mmap: MmapMut,
 }
 
-impl MemMapBackend { 
+impl MemMapBackend {
     #[inline]
     fn grow_if_needed(&mut self, additional_bytes_len: u64) -> Result<(), std::io::Error> {
         #[cfg(debug_assertions)] { 
@@ -47,7 +44,6 @@ impl MemMapBackend {
         if (self.current_offset + additional_bytes_len) > self.current_file_len { 
             let to_grow = GROW_BY.max(additional_bytes_len as usize);
             let new_len = self.current_file_len + to_grow as u64;
-
 
             #[cfg(debug_assertions)] { 
                 println!("Growing file to {}...", new_len);
@@ -85,14 +81,12 @@ impl MemMapBackend {
         }
         Ok(())
     }
-    pub fn get_file_len(&self) -> u64 { 
+    pub fn get_file_len(&self) -> u64 {
         self.current_file_len
-    } 
+    }
 }
 
 impl MessageRecordBackend for MemMapBackend {
-    type WriteMsgFuture = futures::future::Ready<Result<(), std::io::Error>>;
-
     fn init<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -140,7 +134,7 @@ impl MessageRecordBackend for MemMapBackend {
     }
 
     #[inline]
-    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Self::WriteMsgFuture {
+    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
         // Length of message payload to append.
         let message_len = message.as_ref().len() as usize; 
         assert!(message_len < LengthTag::MAX as usize);
@@ -156,9 +150,7 @@ impl MessageRecordBackend for MemMapBackend {
         let new_record_end = self.current_offset + additional_len as u64;
 
         // Grow the file and associated memmap
-        if let Err(e) = self.grow_if_needed(additional_len as u64) { 
-            return future::err(e);
-        }
+        self.grow_if_needed(additional_len as u64)?;
 
         /*#[cfg(unix)]
         { 
@@ -192,15 +184,13 @@ impl MessageRecordBackend for MemMapBackend {
             written_len += LENGTH_TAG_LEN;
         }
         
-        match self.mmap.flush_range(self.mmap_cursor, written_len) {
-            Ok(_) => {
-                // Update our current offset counter.
-                self.current_offset = new_record_end;
-                self.mmap_cursor += written_len;
-                future::ok(())
-            },
-            Err(e) => future::err(e.into()),
-        }
+        self.mmap.flush_range(self.mmap_cursor, written_len)?;
+
+        // Update our current offset counter.
+        self.current_offset = new_record_end;
+        self.mmap_cursor += written_len;
+
+        Ok(())
     }
     fn initial_offset(&self) -> u64 { 
         self.start_offset
@@ -212,23 +202,19 @@ impl MessageRecordBackend for MemMapBackend {
 
 #[cfg(test)]
 pub mod test_util {
-    use futures::future;
-
     use super::{MessageRecordBackend, LengthTag};
 
     pub struct DummyBackend{}
 
     impl MessageRecordBackend for DummyBackend {
-        type WriteMsgFuture = futures::future::Ready<Result<(), std::io::Error>>;
-
         #[allow(unused_variables)]
         fn init<T: AsRef<std::path::Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> {
             Ok(DummyBackend{})
         }
 
         #[allow(unused_variables)]
-        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Self::WriteMsgFuture {
-            future::ok(())
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+            Ok(())
         }
 
         fn initial_offset(&self) -> u64 { 0 }
@@ -240,8 +226,6 @@ pub mod test_util {
     }
 
     impl MessageRecordBackend for VecBackend {
-        type WriteMsgFuture = futures::future::Ready<Result<(), std::io::Error>>;
-
         #[allow(unused_variables)]
         fn init<T: AsRef<std::path::Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> {
             Ok(
@@ -252,13 +236,13 @@ pub mod test_util {
         }
 
         #[allow(unused_variables)]
-        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Self::WriteMsgFuture {
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
             // Length-prefixing. 
             let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
             self.inner.extend_from_slice(&len_bytes);
             // Write message.
             self.inner.extend_from_slice(message.as_ref());
-            future::ok(())
+            Ok(())
         }
 
         fn initial_offset(&self) -> u64 { 0 }
