@@ -7,15 +7,15 @@ use rkyv::{
     Archive,
 };
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage, EpochId};
-use tokio::sync::broadcast::Receiver;
+use tokio::{sync::broadcast::Receiver, io::{AsyncReadExt, AsyncWriteExt}};
 use std::{
     collections::HashMap,
     fmt::Display,
     io::{self, ErrorKind as IoErrorKind},
-    net::{Ipv6Addr, SocketAddrV6, UdpSocket},
+    net::{Ipv6Addr, SocketAddrV6, UdpSocket, IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::atomic::{AtomicU64, self}, time::Duration,
+    sync::atomic::{AtomicU64, self}, time::Duration, str::FromStr,
 };
 
 pub mod record;
@@ -27,6 +27,8 @@ struct Args {
     pub instance: u16,
     #[clap(short, long, default_value_t = 0)]
     pub port: u16,
+    #[clap(short, long)]
+    pub address: String,
     #[clap(short = 'p', long = "recordpath")]
     pub record_path: PathBuf,
     #[clap(short = 'e', long = "epoch", default_value_t = 0)]
@@ -386,7 +388,7 @@ fn main() -> std::io::Result<()> {
         }
     }
     
-    let _runtime = build_async_runtime().unwrap();
+    let runtime = build_async_runtime().unwrap();
 
     // Load our record file. 
     let record = record::MemMapBackend::init(path, args.offset)?;
@@ -394,7 +396,46 @@ fn main() -> std::io::Result<()> {
     let initial_offset = record.initial_offset();
     CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
 
-    let _offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
+    let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
+
+    let tcp_addr = args.address.clone();
+    let tcp_port = args.port; 
+
+    runtime.spawn(async move {
+        let address = match IpAddr::from_str(&tcp_addr) {
+            Ok(addr) => SocketAddr::from((addr, tcp_port)),
+            Err(parse_err) => match tokio::net::lookup_host(&tcp_addr).await { 
+                Ok(mut addrs) => { 
+                    SocketAddr::from((addrs.next().unwrap().ip(), tcp_port))
+                }, 
+                Err(lookup_err) => { 
+                    panic!("Failed to parse {} as an IP address - when assuming it was a URL, DNS lookup failed with, {:?}", &tcp_addr, lookup_err) 
+                }
+            },
+        };
+
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        //Make sure the closure captures it before borrowing it off into another closure.
+        let offset_change_receiver = offset_change_receiver;
+        loop {
+            let (mut socket, _peer_addr) = listener.accept().await.unwrap();
+            let mut local_change_receiver = offset_change_receiver.resubscribe();
+            tokio::spawn(async move {
+                let mut read_buf = [0u8; 4096];
+                let (mut reader, mut writer) = socket.split();
+                loop { 
+                    tokio::select! {
+                        new_bytes = local_change_receiver.recv() => { 
+                            //Todo: Read from mem-mapped file, send off new messages to subscribers.
+                        }
+                        len_read = reader.read(&mut read_buf) => { 
+                            //Todo: Read inbound messages
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     let inbound_server = InboundServer::new(args.port, record, initial_offset, args.sequence);
     inbound_server
@@ -403,7 +444,6 @@ fn main() -> std::io::Result<()> {
 }
 
 // Tests
-
 #[cfg(test)]
 mod test {
     use std::{
