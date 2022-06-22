@@ -1,14 +1,19 @@
 use bytecheck::StructCheckError;
 use clap::Parser;
 use record::MessageRecordBackend;
-use rkyv::{validation::{validators::DefaultValidatorError, CheckArchiveError}, Archive};
+use rkyv::{
+    validation::{validators::DefaultValidatorError, CheckArchiveError},
+    Archive,
+};
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage};
 use std::{
     collections::HashMap,
     fmt::Display,
-    io::{ErrorKind as IoErrorKind, self},
+    io::{self, ErrorKind as IoErrorKind},
     net::{Ipv6Addr, SocketAddrV6, UdpSocket},
-    pin::Pin, path::PathBuf, sync::atomic::{AtomicU64}, thread, num::NonZeroUsize,
+    path::PathBuf,
+    pin::Pin,
+    sync::atomic::AtomicU64,
 };
 
 pub mod record;
@@ -20,14 +25,15 @@ struct Args {
     pub instance: u16,
     #[clap(short, long, default_value_t = 0)]
     pub port: u16,
-    #[clap(short='p', long="recordpath")]
+    #[clap(short = 'p', long = "recordpath")]
     pub record_path: PathBuf,
 }
 
 pub type ReadArchiveError = CheckArchiveError<StructCheckError, DefaultValidatorError>;
 
-/// How many bytes have been published to the message bus (during this epoch) in total?
-pub static CURRENT_OFFSET: AtomicU64 = AtomicU64::new(0u64); 
+/// How many bytes have been published to the message bus (during this epoch) in
+/// total?
+pub static CURRENT_OFFSET: AtomicU64 = AtomicU64::new(0u64);
 
 #[derive(Debug)]
 pub enum SequencerError {
@@ -35,17 +41,18 @@ pub enum SequencerError {
     /// and could not be read by rkyv. We have to first format the
     /// underlying error to a string because a CheckArchiveError is not Send
     CouldNotParse(String),
-    /// Duplicate message received. Non-fatal error, but useful to propagate for metrics.
+    /// Duplicate message received. Non-fatal error, but useful to propagate for
+    /// metrics.
     DuplicateMessage(AppId, u64, u64),
-    /// The sequencer could not bind the local socket 
+    /// The sequencer could not bind the local socket
     /// required to read incoming UDP packets.
     UdpBindError(u16, std::io::Error),
     /// socket.recv_from() failed
     UdpReceiveError(std::io::Error),
-    /// Unable to write a received message to our record file. 
+    /// Unable to write a received message to our record file.
     WriteToFile(std::io::Error),
     /// Failed to change the properties of a UDPSocket.
-    SocketChangeFailed(std::io::Error), 
+    SocketChangeFailed(std::io::Error),
 }
 
 impl Display for SequencerError {
@@ -94,21 +101,22 @@ pub enum SequencerErrorKind {
     /// and could not be read by rkyv. We have to first format the
     /// underlying error to a string because a CheckArchiveError is not Send
     CouldNotParse,
-    /// Duplicate message received. Non-fatal error, but useful to propagate for metrics.
+    /// Duplicate message received. Non-fatal error, but useful to propagate for
+    /// metrics.
     DuplicateMessage,
     /// The sequencer could not bind the local socket required to read incoming
     /// UDP packets.
     UdpBindError,
     /// socket.recv_from() failed
     UdpReceiveError,
-    /// Unable to write a received message to our record file. 
+    /// Unable to write a received message to our record file.
     WriteToFile,
     /// Failed to change the properties of a UDPSocket.
     SocketChangeFailed,
 }
 
 impl SequencerError {
-    pub fn get_kind(&self) -> SequencerErrorKind { 
+    pub fn get_kind(&self) -> SequencerErrorKind {
         match self {
             SequencerError::CouldNotParse(_) => SequencerErrorKind::CouldNotParse,
             SequencerError::DuplicateMessage(_, _, _) => SequencerErrorKind::DuplicateMessage,
@@ -134,10 +142,13 @@ struct InboundServer<Record: MessageRecordBackend> {
     /// Used to deduplicate messages.
     app_sequence_numbers: HashMap<AppId, u64>,
     /// Underlying storage to which we write our messages.
-    pub record: Record, 
+    pub record: Record,
 }
 
-impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
+impl<Record> InboundServer<Record>
+where
+    Record: MessageRecordBackend,
+{
     pub fn new(port: u16, record: Record) -> InboundServer<Record> {
         InboundServer {
             port,
@@ -157,9 +168,12 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
 
         message.modify_sequence_number(self.counter)
     }
-    
+
     #[inline]
-    pub fn process_inbound_message<'a>(&mut self, data: Pin<&'a mut <SequencerMessage as Archive>::Archived>) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerError> { 
+    pub fn process_inbound_message<'a>(
+        &mut self,
+        data: Pin<&'a mut <SequencerMessage as Archive>::Archived>,
+    ) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerError> {
         let app_id = data.app_id;
         let app_sequence_number = data.app_sequence_number;
 
@@ -167,7 +181,11 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
             if *previous_app_seq >= app_sequence_number {
                 //We have seen this before, it's old news.
                 // Deduplicate.
-                Err(SequencerError::DuplicateMessage(app_id, app_sequence_number, *previous_app_seq))
+                Err(SequencerError::DuplicateMessage(
+                    app_id,
+                    app_sequence_number,
+                    *previous_app_seq,
+                ))
             } else {
                 //New sequence number! Publish this message.
                 *previous_app_seq = app_sequence_number;
@@ -184,56 +202,63 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
         }
     }
 
-
-    /// Write the provided message to our record file. 
+    /// Write the provided message to our record file.
     #[inline]
-    pub fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> std::result::Result<(), SequencerError> {
-        self.record.write_message(message)
-            .map_err(|e| SequencerError::WriteToFile(e))?;
+    pub fn write_message<T: AsRef<[u8]>>(
+        &mut self,
+        message: T,
+    ) -> std::result::Result<(), SequencerError> {
+        self.record
+            .write_message(message)
+            .map_err(SequencerError::WriteToFile)?;
         let offset = self.record.record_len();
-        CURRENT_OFFSET.store(offset, std::sync::atomic::Ordering::Relaxed); // TODO - Should we be using another ordering? 
+        CURRENT_OFFSET.store(offset, std::sync::atomic::Ordering::Relaxed); // TODO - Should we be using another ordering?
         Ok(())
     }
 
     #[inline]
-    pub fn poll_message<'a>(&mut self, socket: &UdpSocket, recv_buffer: &'a mut Vec<u8>) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64), SequencerError> { 
+    pub fn poll_message<'a>(
+        &mut self,
+        socket: &UdpSocket,
+        recv_buffer: &'a mut Vec<u8>,
+    ) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64), SequencerError> {
         let (message_len, _addr) = socket
             .recv_from(recv_buffer)
             .map_err(SequencerError::UdpReceiveError)?;
         rkyv::check_archived_root::<SequencerMessage>(&recv_buffer[..message_len])
-            .map_err(|e| 
-                SequencerError::CouldNotParse(format!("{:?}", e))
-            )?;
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))?;
         // Per discussion with the rkyv author on Discord, calling check_archived_root()
         // and then only calling archived_root_mut() if the
         // validation succeeds should be very safe, assuming
         // no critical bugs present in check_archived_root()
         // The Rkyv author also mentioned that no work should get duplicated here.
         let data = unsafe {
-            rkyv::archived_root_mut::<SequencerMessage>(Pin::new(
-                &mut recv_buffer[..message_len],
-            ))
+            rkyv::archived_root_mut::<SequencerMessage>(Pin::new(&mut recv_buffer[..message_len]))
         };
         Ok((data, message_len as u64))
     }
 
     #[inline]
-    pub fn step(&mut self, socket: &UdpSocket, recv_buffer: &mut Vec<u8>) -> std::result::Result<(), SequencerError> {
+    pub fn step(
+        &mut self,
+        socket: &UdpSocket,
+        recv_buffer: &mut Vec<u8>,
+    ) -> std::result::Result<(), SequencerError> {
         let (data, message_len) = self.poll_message(socket, recv_buffer)?;
         let message_maybe = match self.process_inbound_message(data) {
             Ok(msg) => Some(msg),
             Err(e) => match e.get_kind() {
-                SequencerErrorKind::DuplicateMessage => { 
-                    // Only in debug builds - avoid formatting strings in the hot path in release. 
+                SequencerErrorKind::DuplicateMessage => {
+                    // Only in debug builds - avoid formatting strings in the hot path in release.
                     #[cfg(debug_assertions)]
                     {
                         println!("Encountered duplicate message: {:?}", e);
                     }
-                    // Duplicate message, ignore. 
+                    // Duplicate message, ignore.
                     None
-                },
+                }
                 _ => {
-                    // Irrecoverable error 
+                    // Irrecoverable error
                     return Err(e);
                 }
             },
@@ -251,34 +276,36 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, self.port, 0, 0);
         let listener = UdpSocket::bind(&addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))?;
-        listener.set_nonblocking(false)
-            .map_err(|e| SequencerError::SocketChangeFailed(e))?;
+        listener
+            .set_nonblocking(false)
+            .map_err(SequencerError::SocketChangeFailed)?;
 
         println!("Launching server, bound to socket {:?}", &addr);
         let mut recv_buffer = vec![0u8; 2048];
         loop {
-            self.step( &listener, &mut recv_buffer)?;
+            self.step(&listener, &mut recv_buffer)?;
         }
     }
 
     #[allow(dead_code)]
-    /// Consumes the server object, returning an owned copy of 
-    /// the MessageRecordBackend written to. Used mostly for testing. 
+    /// Consumes the server object, returning an owned copy of
+    /// the MessageRecordBackend written to. Used mostly for testing.
     pub fn into_record(self) -> Record {
         self.record
     }
 }
 
-/// How many worker threads can we safely spin up 
-/// without fighting with the sequencer thread for cycles? 
-/// Returns (non_blocking, blocking) 
+/// How many worker threads can we safely spin up
+/// without fighting with the sequencer thread for cycles?
+/// Returns (non_blocking, blocking)
 fn estimate_threads_for_async() -> (usize, usize) {
-    // Number of threads reserved for the sequencer 
-    // (and also possibly the OS depending on what kinds of guesses we want to make here)
-    const RESERVE: usize = 1; 
-    
-    let available_threads: usize = match std::thread::available_parallelism() { 
-        Ok(val) => val.into(), 
+    // Number of threads reserved for the sequencer
+    // (and also possibly the OS depending on what kinds of guesses we want to make
+    // here)
+    const RESERVE: usize = 1;
+
+    let available_threads: usize = match std::thread::available_parallelism() {
+        Ok(val) => val.into(),
         Err(e) => {
             eprintln!("Unable to get a count of available threads from the OS, defaulting to 1. Error was: {:?}", e);
             eprintln!("Unable to get a count of available threads from the OS, defaulting to 1. Error was: {:?}", e);
@@ -286,18 +313,20 @@ fn estimate_threads_for_async() -> (usize, usize) {
         }
     };
 
-    let non_blocking = if ((available_threads as i64) - (RESERVE as i64) - 1 /* for the Tokio blocking thread */) < 1 { 
+    let non_blocking = if ((available_threads as i64) - (RESERVE as i64) - 1/* for the Tokio blocking thread */)
+        < 1
+    {
         1usize
-    } else { 
-        ( (available_threads as i64) - (RESERVE as i64) - 1 ) as usize
+    } else {
+        ((available_threads as i64) - (RESERVE as i64) - 1) as usize
     };
 
     (non_blocking, 1)
 }
 
 fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
-    let (non_blocking_threads, blocking_threads) = estimate_threads_for_async(); 
-    println!("Initializing Tokio runtime with {} async worker threads and {} blocking threads provided to it.", non_blocking_threads, blocking_threads); 
+    let (non_blocking_threads, blocking_threads) = estimate_threads_for_async();
+    println!("Initializing Tokio runtime with {} async worker threads and {} blocking threads provided to it.", non_blocking_threads, blocking_threads);
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
     runtime_builder.max_blocking_threads(blocking_threads);
@@ -315,40 +344,48 @@ fn main() -> std::io::Result<()> {
     }
 
     //Make sure the path exists.
-    let mut path: PathBuf = args.record_path.into();
-    //No record file? 
-    if path.as_os_str().is_empty() { 
+    let mut path: PathBuf = args.record_path;
+    //No record file?
+    if path.as_os_str().is_empty() {
         // TODO: Figure out better defaults for record file path.
         path = PathBuf::from("messagebus");
     }
     //Make sure our directory exists.
-    if let Some(parent) = path.parent() { 
-        if parent.is_dir() { 
+    if let Some(parent) = path.parent() {
+        if parent.is_dir() {
             std::fs::create_dir_all(parent)?;
         }
     }
 
-    let _runtime = build_async_runtime().unwrap(); 
+    let _runtime = build_async_runtime().unwrap();
 
     // TODO: Persist starting offset.
     let record = record::MemMapBackend::init(path, 0)?;
 
     let inbound_server = InboundServer::new(args.port, record);
-    inbound_server.start().map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
+    inbound_server
+        .start()
+        .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
 }
-
 
 // Tests
 
 #[cfg(test)]
 mod test {
-    use std::{io::Read, path::Path, sync::{Mutex, atomic}};
+    use std::{
+        io::Read,
+        path::Path,
+        sync::{atomic, Mutex},
+    };
 
-    use crate::record::{test_util::{DummyBackend, VecBackend, MultiPushBackend}, MemMapBackend};
+    use crate::record::{
+        test_util::{DummyBackend, MultiPushBackend, VecBackend},
+        MemMapBackend,
+    };
 
     use super::*;
     use lazy_static::lazy_static;
-    use tokio::sync::broadcast::{Sender, Receiver};
+    use tokio::sync::broadcast::{Receiver, Sender};
 
     // Any localhost-related network tests will interfere with eachother if you use
     // the cargo test command, which is multithreaded by default.
@@ -361,13 +398,12 @@ mod test {
 
     #[test]
     fn test_stream_received() {
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-        let _guard = IO_TEST_PERMISSIONS.lock();
         use rkyv::Deserialize;
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
         let _guard = IO_TEST_PERMISSIONS.lock();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
 
         // Dummy message for testing.
         let example_message = "Hello, world!";
@@ -381,11 +417,11 @@ mod test {
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend{});
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {});
 
         let server_listener = UdpSocket::bind(server_addr)
-            
-            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
+            .unwrap();
 
         // Start a client
         let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
@@ -397,14 +433,20 @@ mod test {
         let res = client.send_to(&data, &server_addr);
         println!("{:?}", res);
 
-
         let mut recv_buffer = vec![0u8; 2048];
-        let (raw_message, _len): (Pin<&mut ArchivedSequencerMessage>, u64) = inbound_server.poll_message(&server_listener, &mut recv_buffer).unwrap(); 
-        let message: Pin<&mut ArchivedSequencerMessage> = inbound_server.process_inbound_message(raw_message).unwrap();
+        let (raw_message, _len): (Pin<&mut ArchivedSequencerMessage>, u64) = inbound_server
+            .poll_message(&server_listener, &mut recv_buffer)
+            .unwrap();
+        let message: Pin<&mut ArchivedSequencerMessage> =
+            inbound_server.process_inbound_message(raw_message).unwrap();
         // Extract a message back out
-        // This always returns With<_, _>, no matter 
-        // how I try to finagle it. So, commenting this test out for now. 
-        let deserialized: SequencerMessage = message.as_ref().get_ref().deserialize(&mut rkyv::Infallible::default()).unwrap();
+        // This always returns With<_, _>, no matter
+        // how I try to finagle it. So, commenting this test out for now.
+        let deserialized: SequencerMessage = message
+            .as_ref()
+            .get_ref()
+            .deserialize(&mut rkyv::Infallible::default())
+            .unwrap();
 
         // Validate the way the sequencer parsed the message.
         assert_eq!(deserialized.app_id, input.app_id);
@@ -419,19 +461,17 @@ mod test {
 
     #[test]
     fn test_counter() {
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
         let _guard = IO_TEST_PERMISSIONS.lock();
-
+        
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend{});
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {});
 
         let server_listener = UdpSocket::bind(server_addr)
-            
-            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
+            .unwrap();
 
         // Send some messages.
         const NUM_TEST_SENDERS: usize = 20;
@@ -454,17 +494,16 @@ mod test {
                 // client.connect(&server_addr).unwrap();
 
                 // Send the archive
-                client
-                    .send_to(&data, &server_addr)
-                    
-                    .expect("Failed to send");
+                client.send_to(&data, &server_addr).expect("Failed to send");
             }
         }
 
         let mut recv_buffer = vec![0u8; 2048];
-        for _i in 0 .. (NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
+        for _i in 0..(NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
+            let (data, _len) = inbound_server
+                .poll_message(&server_listener, &mut recv_buffer)
+                .unwrap();
             //There should be no duplicates here.
             let resl = inbound_server.process_inbound_message(data).unwrap();
             assert!(inbound_server.counter > prev_counter);
@@ -477,10 +516,10 @@ mod test {
             (NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64
         );
 
-        
-        // Now send it some garbage. 
+        // Now send it some garbage.
         // It will have seen all of these app-sequence-numbers before
-        //println!("Sending messages which should be deduplicated (using previous app sequence numbers).");
+        //println!("Sending messages which should be deduplicated (using previous app
+        // sequence numbers).");
         for app_id in 0..NUM_TEST_SENDERS {
             for i in 0..NUM_MESSAGE_TEST {
                 // Dummy message for testing.
@@ -496,15 +535,14 @@ mod test {
                 // client.connect(&server_addr).unwrap();
 
                 // Send the archive
-                client
-                    .send_to(&data, &server_addr)
-                    
-                    .expect("Failed to send");
+                client.send_to(&data, &server_addr).expect("Failed to send");
             }
         }
-        for _i in 0..(NUM_TEST_SENDERS*NUM_MESSAGE_TEST) as u64 {
+        for _i in 0..(NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
+            let (data, _len) = inbound_server
+                .poll_message(&server_listener, &mut recv_buffer)
+                .unwrap();
             //Should always be a duplicate in this context.
             let _resl = inbound_server.process_inbound_message(data).unwrap_err();
             assert_eq!(inbound_server.counter, prev_counter);
@@ -519,7 +557,8 @@ mod test {
         );
 
         //But if we send it a new one, it should recognize it.
-        //println!("Lastly, sending a new message which should be new and not deduplicated.");
+        //println!("Lastly, sending a new message which should be new and not
+        // deduplicated.");
         let example_message = "Foo, and also bar!";
         let payload = example_message.as_bytes().to_vec();
         // Build an archive
@@ -536,7 +575,9 @@ mod test {
         res.expect("Failed to send");
 
         //println!("Processing message # {}", total_received);
-        let (data, _len) = inbound_server.poll_message( &server_listener, &mut recv_buffer).unwrap();
+        let (data, _len) = inbound_server
+            .poll_message(&server_listener, &mut recv_buffer)
+            .unwrap();
         let _resl = inbound_server.process_inbound_message(data).unwrap();
         //println!("Finally, counter is {}", inbound_server.counter);
 
@@ -549,7 +590,11 @@ mod test {
 
     // Generates a message record for testing purposes.
     // This is used as the first half of a couple of other tests.
-    fn test_record_emit<T: MessageRecordBackend>(num_tests: u64, counter_start: u64, record: T) -> Result<T, Box<dyn std::error::Error>> {
+    fn test_record_emit<T: MessageRecordBackend>(
+        num_tests: u64,
+        counter_start: u64,
+        record: T,
+    ) -> Result<T, Box<dyn std::error::Error>> {
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
 
@@ -559,57 +604,56 @@ mod test {
         server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
-            
-            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
+            .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
+            .unwrap();
 
         // Send a message from a client.
 
         for i in 0..num_tests {
-                // Dummy message for testing.
-                let example_message = format!("Hello, world! This is message #{}", i+counter_start);
-                let payload = example_message.as_bytes().to_vec();
-                // Build an archive
-                let mut input = SequencerMessage::new(1 as AppId, 1, 2, counter_start+i, payload);
-                // Give it some stupid garbage as its sequence number, so we can be sure the server overwrites it.
-                input.sequence_number = u64::MAX;
-                //Serialize.
-                let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+            // Dummy message for testing.
+            let example_message = format!("Hello, world! This is message #{}", i + counter_start);
+            let payload = example_message.as_bytes().to_vec();
+            // Build an archive
+            let mut input = SequencerMessage::new(1 as AppId, 1, 2, counter_start + i, payload);
+            // Give it some stupid garbage as its sequence number, so we can be sure the
+            // server overwrites it.
+            input.sequence_number = u64::MAX;
+            //Serialize.
+            let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
 
-                // Start a client
-                let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let client = UdpSocket::bind(&client_addr).unwrap();
-                // client.connect(&server_addr).unwrap();
+            // Start a client
+            let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+            let client = UdpSocket::bind(&client_addr).unwrap();
+            // client.connect(&server_addr).unwrap();
 
-                // Send the archive
-                client
-                    .send_to(&data, &server_addr)
-                    
-                    .expect("Failed to send");
+            // Send the archive
+            client.send_to(&data, &server_addr).expect("Failed to send");
         }
 
-        // Receive. 
+        // Receive.
         let mut recv_buffer = vec![0u8; 2048];
         for _ in 0..num_tests {
             server.step(&server_listener, &mut recv_buffer).unwrap();
         }
-        
+
         Ok(server.into_record())
     }
 
-    fn msgrecord_to_messages<T: AsRef<[u8]>>(data: T) -> Vec<Vec<u8>> { 
+    fn msgrecord_to_messages<T: AsRef<[u8]>>(data: T) -> Vec<Vec<u8>> {
         let mut messages: Vec<Vec<u8>> = Vec::default();
-        let mut cursor = 0 as usize;  
-        while cursor < data.as_ref().len() { 
+        let mut cursor = 0_usize;
+        while cursor < data.as_ref().len() {
             let mut length_tag_bytes = [0u8; record::LENGTH_TAG_LEN];
-            length_tag_bytes.copy_from_slice(&data.as_ref()[cursor..cursor+record::LENGTH_TAG_LEN]);
+            length_tag_bytes
+                .copy_from_slice(&data.as_ref()[cursor..cursor + record::LENGTH_TAG_LEN]);
             let length = record::LengthTag::from_le_bytes(length_tag_bytes) as usize;
-            if length == 0 { 
-                break
+            if length == 0 {
+                break;
             }
-            assert!( cursor + record::LENGTH_TAG_LEN + length <= data.as_ref().len() );
+            assert!(cursor + record::LENGTH_TAG_LEN + length <= data.as_ref().len());
 
             cursor += record::LENGTH_TAG_LEN;
-            messages.push((&data.as_ref()[cursor..cursor+length]).to_vec());
+            messages.push((&data.as_ref()[cursor..cursor + length]).to_vec());
             cursor += length;
         }
         messages
@@ -617,54 +661,67 @@ mod test {
 
     #[test]
     fn record_vec() {
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-        const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock();
-        let record = test_record_emit(NUM_TESTS as u64, 0, VecBackend{inner: Vec::default()}).unwrap();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+        const NUM_TESTS: usize = 32;
+        let record = test_record_emit(
+            NUM_TESTS as u64,
+            0,
+            VecBackend {
+                inner: Vec::default(),
+            },
+        )
+        .unwrap();
         drop(_guard);
         println!("File is {} bytes.", record.inner.len());
 
         let messages: Vec<Vec<u8>> = msgrecord_to_messages(&record.inner);
 
         assert_eq!(messages.len(), NUM_TESTS);
-        
-        for (i, message) in messages.iter().enumerate() { 
-            println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
-            let converted = String::from_utf8_lossy(&message); 
+
+        for (i, message) in messages.iter().enumerate() {
+            println!(
+                "Message {} is {} bytes: {}",
+                i,
+                message.len(),
+                hex::encode_upper(&message)
+            );
+            let converted = String::from_utf8_lossy(message);
             let expected_message = format!("Hello, world! This is message #{}", i);
             assert!(converted.contains(&expected_message));
 
-            let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+            let deserialized: SequencerMessage = rkyv::from_bytes(message).unwrap();
             // App should have overwritten the sequence number gracefully.
-            assert_eq!(deserialized.sequence_number, (i as u64)+1);
+            assert_eq!(deserialized.sequence_number, (i as u64) + 1);
             assert_eq!(deserialized.app_sequence_number, i as u64);
         }
     }
 
     #[test]
     fn record_mmap_file() {
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-        const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+        const NUM_TESTS: usize = 32;
 
         //Ignore if it already exists.
-        #[allow(unused_must_use)] { 
+        #[allow(unused_must_use)]
+        {
             std::fs::create_dir(Path::new("test_output/"));
         }
 
         let path = Path::new("test_output/messagebus");
 
         // If a test failed, clean up after it.
-        if path.exists() { 
+        if path.exists() {
             std::fs::remove_file(path).unwrap();
         }
 
         let record = MemMapBackend::init(&path, 0).unwrap();
         let record = test_record_emit(NUM_TESTS as u64, 0, record).unwrap();
 
-        // Make sure the file handle gets dropped so we can open it again without clobbering anything.
+        // Make sure the file handle gets dropped so we can open it again without
+        // clobbering anything.
         drop(record);
-
 
         let mut file = std::fs::File::open(&path).unwrap();
         let mut data = Vec::default();
@@ -675,115 +732,131 @@ mod test {
 
         assert_eq!(messages.len(), NUM_TESTS);
 
-        for (i, message) in messages.iter().enumerate() { 
-            println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
-            let converted = String::from_utf8_lossy(&message); 
+        for (i, message) in messages.iter().enumerate() {
+            println!(
+                "Message {} is {} bytes: {}",
+                i,
+                message.len(),
+                hex::encode_upper(&message)
+            );
+            let converted = String::from_utf8_lossy(message);
             let expected_message = format!("Hello, world! This is message #{}", i);
             assert!(converted.contains(&expected_message));
 
-            let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+            let deserialized: SequencerMessage = rkyv::from_bytes(message).unwrap();
             // App should have overwritten the sequence number gracefully.
-            assert_eq!(deserialized.sequence_number, (i as u64)+1);
+            assert_eq!(deserialized.sequence_number, (i as u64) + 1);
             assert_eq!(deserialized.app_sequence_number, i as u64);
         }
-        //Clean up 
+        //Clean up
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
     }
 
-
     #[test]
     fn multiple_sessions_mmap_file() {
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-        const NUM_TESTS_INITIAL: usize = 32; 
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+        const NUM_TESTS_INITIAL: usize = 32;
         let _guard = IO_TEST_PERMISSIONS.lock();
 
         //Ignore if it already exists.
-        #[allow(unused_must_use)] { 
+        #[allow(unused_must_use)]
+        {
             std::fs::create_dir(Path::new("test_output/"));
         }
 
         let path = Path::new("test_output/messagebus");
 
         // If a test failed, clean up after it.
-        if path.exists() { 
+        if path.exists() {
             std::fs::remove_file(path).unwrap();
         }
         #[allow(unused_assignments)]
         let mut last_offset = 0;
 
-        { 
+        {
             let record = MemMapBackend::init(&path, 0).unwrap();
-            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).unwrap();
+            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0_u64, record).unwrap();
 
             last_offset = record.record_len();
-            // Make sure the file handle gets dropped so we can open it again without clobbering anything.
+            // Make sure the file handle gets dropped so we can open it again without
+            // clobbering anything.
             drop(record);
-    
-    
+
             let mut file = std::fs::File::open(&path).unwrap();
             let mut data = Vec::default();
             file.read_to_end(&mut data).unwrap();
             drop(file);
-    
+
             let messages = msgrecord_to_messages(&data);
-    
+
             assert_eq!(messages.len(), NUM_TESTS_INITIAL);
-    
-            for (i, message) in messages.iter().enumerate() { 
-                println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
-                let converted = String::from_utf8_lossy(&message); 
+
+            for (i, message) in messages.iter().enumerate() {
+                println!(
+                    "Message {} is {} bytes: {}",
+                    i,
+                    message.len(),
+                    hex::encode_upper(&message)
+                );
+                let converted = String::from_utf8_lossy(message);
                 let expected_message = format!("Hello, world! This is message #{}", i);
                 assert!(converted.contains(&expected_message));
-    
-                let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+
+                let deserialized: SequencerMessage = rkyv::from_bytes(message).unwrap();
                 // App should have overwritten the sequence number gracefully.
-                assert_eq!(deserialized.sequence_number, (i as u64)+1);
+                assert_eq!(deserialized.sequence_number, (i as u64) + 1);
                 assert_eq!(deserialized.app_sequence_number, i as u64);
             }
         }
-        const NUM_TESTS_SECOND: usize = 72; 
+        const NUM_TESTS_SECOND: usize = 72;
 
-        { 
+        {
             let record = MemMapBackend::init(&path, last_offset).unwrap();
-            let record = test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record).unwrap();
+            let record =
+                test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record)
+                    .unwrap();
 
-            // Make sure the file handle gets dropped so we can open it again without clobbering anything.
+            // Make sure the file handle gets dropped so we can open it again without
+            // clobbering anything.
             drop(record);
-    
+
             let mut file = std::fs::File::open(&path).unwrap();
             let mut data = Vec::default();
             file.read_to_end(&mut data).unwrap();
             drop(file);
-    
+
             let messages = msgrecord_to_messages(&data);
-    
-            assert_eq!(messages.len(), NUM_TESTS_INITIAL+NUM_TESTS_SECOND);
-    
-            for (i, message) in messages.iter().enumerate() { 
-                println!("Message {} is {} bytes: {}", i, message.len(), hex::encode_upper(&message));
-                let converted = String::from_utf8_lossy(&message); 
+
+            assert_eq!(messages.len(), NUM_TESTS_INITIAL + NUM_TESTS_SECOND);
+
+            for (i, message) in messages.iter().enumerate() {
+                println!(
+                    "Message {} is {} bytes: {}",
+                    i,
+                    message.len(),
+                    hex::encode_upper(&message)
+                );
+                let converted = String::from_utf8_lossy(message);
                 let expected_message = format!("Hello, world! This is message #{}", i);
                 assert!(converted.contains(&expected_message));
-    
-                let deserialized: SequencerMessage = rkyv::from_bytes(&message).unwrap();
+
+                let deserialized: SequencerMessage = rkyv::from_bytes(message).unwrap();
                 // App should have overwritten the sequence number gracefully.
-                assert_eq!(deserialized.sequence_number, (i as u64)+1);
+                assert_eq!(deserialized.sequence_number, (i as u64) + 1);
                 assert_eq!(deserialized.app_sequence_number, i as u64);
             }
         }
-        //Clean up 
+        //Clean up
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
     }
-    
+
     #[derive(Debug, Clone)]
-    enum TestError { 
-        CounterOutOfStep(u64, u64), 
+    enum TestError {
+        CounterOutOfStep(u64, u64),
         RecvChannelError,
-        SendChannelError,
-        RecvUdpError(String),
         SendUdpErr(String),
         BindUdpErr(String),
         SequencerErr(String),
@@ -801,15 +874,6 @@ mod test {
                 TestError::RecvChannelError => write!(
                     f,
                     "Error receiving on a message-passing channel"
-                ),
-                TestError::SendChannelError => write!(
-                    f,
-                    "Error sending on a message-passing channel"
-                ),
-                TestError::RecvUdpError(underlying) => write!(
-                    f,
-                    "Error receiving UDP packet: {}",
-                    underlying,
                 ),
                 TestError::SendUdpErr(underlying) => write!(
                     f,
@@ -834,25 +898,36 @@ mod test {
     #[test]
     pub fn test_offset_counter_consistency() {
         const NUM_TESTS: usize = 32;
-        let guard = IO_TEST_PERMISSIONS.lock();
-        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
-        
+        let _guard = IO_TEST_PERMISSIONS.lock();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+
         let record = MultiPushBackend::new(4096);
         let mut record_receiver = record.sender.subscribe();
         let mut record_receiver_end_result = record.sender.subscribe();
-        //Retain the channel even when the record object gets dropped, so the test doesn't error when it's shutting down.
-        let _record_sender_keepalive = record.sender.clone();
-    
         let runtime = build_async_runtime().unwrap();
 
         // Channels
-        let (counter_error_sender, mut counter_error_receiver): (Sender<TestError>, Receiver<TestError>) = tokio::sync::broadcast::channel(NUM_TESTS);
-        let (continue_clock_sender, mut continue_clock_receiver): (tokio::sync::mpsc::UnboundedSender<()>, tokio::sync::mpsc::UnboundedReceiver<()>) = tokio::sync::mpsc::unbounded_channel();
-        let (end_test_sender, mut end_test_receiver): (Sender<()>, Receiver<()>) = tokio::sync::broadcast::channel(NUM_TESTS);
+        let (counter_error_sender, mut counter_error_receiver): (
+            Sender<TestError>,
+            Receiver<TestError>,
+        ) = tokio::sync::broadcast::channel(NUM_TESTS);
+        let (continue_clock_sender, mut continue_clock_receiver): (
+            tokio::sync::mpsc::UnboundedSender<()>,
+            tokio::sync::mpsc::UnboundedReceiver<()>,
+        ) = tokio::sync::mpsc::unbounded_channel();
+        let (end_test_sender, mut end_test_receiver): (Sender<()>, Receiver<()>) =
+            tokio::sync::broadcast::channel(NUM_TESTS);
 
         let err_sender_clone = counter_error_sender.clone();
         let mut err_receiver_clone = counter_error_sender.subscribe();
         let mut end_test_receiver_clone = end_test_sender.subscribe();
+
+        // Prevent various race conditions.
+        let _end_tester_keepalive = end_test_sender.clone();
+        let _end_receiver_keepalive = end_test_sender.subscribe(); 
+        //Retain the channel even when the record object gets dropped, so the test
+        // doesn't error when it's shutting down.
+        let _record_sender_keepalive = record.sender.clone();
 
         // Counter-checking task:
         let join_handle_1 = runtime.spawn( async move {
@@ -888,14 +963,15 @@ mod test {
         });
 
         // Message-generating UDP task
-        let join_handle_2 = runtime.spawn( async move {
+        let join_handle_2 = runtime.spawn(async move {
             // Start a server
             let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-            
+
             let mut server = InboundServer::new(server_addr.port(), record);
 
             let server_listener = UdpSocket::bind(server_addr)
-                .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
+                .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
+                .unwrap();
 
             let mut recv_buffer = vec![0u8; 2048];
 
@@ -906,74 +982,92 @@ mod test {
                 let payload = example_message.as_bytes().to_vec();
                 // Build an archive
                 let mut input = SequencerMessage::new(1 as AppId, 1, 2, i as u64, payload);
-                // Give it some stupid garbage as its sequence number, so we can be sure the server overwrites it.
+                // Give it some stupid garbage as its sequence number, so we can be sure the
+                // server overwrites it.
                 input.sequence_number = u64::MAX;
                 //Serialize.
                 let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
 
                 // Start a client
                 let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let client = match UdpSocket::bind(&client_addr) { 
-                    Ok(client) => client, 
-                    Err(e) => { 
-                        counter_error_sender.send(TestError::BindUdpErr(format!("{:?}", e))).unwrap();
+                let client = match UdpSocket::bind(&client_addr) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        counter_error_sender
+                            .send(TestError::BindUdpErr(format!("{:?}", e)))
+                            .unwrap();
                         break;
-                    },
+                    }
                 };
 
                 // Send the archive
                 match client.send_to(&data, &server_addr) {
-                    Ok(_) => {},
-                    Err(e) => { 
-                        counter_error_sender.send(TestError::SendUdpErr(format!("{:?}", e))).unwrap();
+                    Ok(_) => {}
+                    Err(e) => {
+                        counter_error_sender
+                            .send(TestError::SendUdpErr(format!("{:?}", e)))
+                            .unwrap();
                         break;
-                    },
+                    }
                 }
-        
+
                 // Receive.
-                match server.step(&server_listener, &mut recv_buffer) { 
-                    Ok(()) => {}, 
-                    Err(e) => { 
-                        counter_error_sender.send( TestError::SequencerErr(format!("{:?}", e)) ).unwrap();
+                match server.step(&server_listener, &mut recv_buffer) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        counter_error_sender
+                            .send(TestError::SequencerErr(format!("{:?}", e)))
+                            .unwrap();
                     }
                 }
 
                 // Was the test ended by an error elsewhere? If so, break out of the loop.
                 match err_receiver_clone.try_recv() {
-                    Ok(inner_error) => { 
-                        println!("Ending test message-sending thread due to error: {:?}", inner_error);
+                    Ok(inner_error) => {
+                        println!(
+                            "Ending test message-sending thread due to error: {:?}",
+                            inner_error
+                        );
                         break;
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
                         /* No error yet, do nothing */
                     }
-                    Err(_) => { 
-                        println!("Cannot receive on error channel, it must have no senders remaining.");
+                    Err(_) => {
+                        println!(
+                            "Cannot receive on error channel, it must have no senders remaining."
+                        );
                         break;
                     }
-                    _ => {}
                 }
 
                 // Wait for the go-ahead to keep iterating.
-                match continue_clock_receiver.recv().await.ok_or(TestError::RecvChannelError) {
-                    Ok(()) => {},
-                    Err(e) => { 
-                        counter_error_sender.send(e).unwrap(); //If we can't send errors then we're just done anyway, panic and kill the task.
+                match continue_clock_receiver
+                    .recv()
+                    .await
+                    .ok_or(TestError::RecvChannelError)
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        counter_error_sender.send(e).unwrap(); //If we can't send errors then we're just done anyway, panic and kill the
+                                                               // task.
                         break;
-                    },
+                    }
                 }
             }
             end_test_sender.send(()).unwrap();
         });
 
-        let resl: Result<(), TestError> = runtime.block_on( async move { 
-            tokio::select! { 
-                err = counter_error_receiver.recv() => { 
-                    let err = err.unwrap();
-                    Err(err)
+        let resl: Result<(), TestError> = runtime.block_on(async move {
+            tokio::select! {
+                some_kind_of_err = counter_error_receiver.recv() => {
+                    match some_kind_of_err { 
+                        Ok(err) => Err(err), 
+                        Err(_e) => Err(TestError::RecvChannelError),
+                    }
                 }
-                _end = end_test_receiver.recv() => { 
-                    //Test completed successfully, there are no problems. 
+                _end = end_test_receiver.recv() => {
+                    //Test completed successfully, there are no problems.
                     Ok(())
                 }
             }
@@ -982,12 +1076,12 @@ mod test {
         runtime.block_on(join_handle_1).unwrap();
         runtime.block_on(join_handle_2).unwrap();
 
-        //Check to see if the number is right. 
+        //Check to see if the number is right.
         let offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
 
         let mut end_result_record: Vec<u8> = Vec::new();
 
-        while let Ok(mut buf) = record_receiver_end_result.try_recv() { 
+        while let Ok(mut buf) = record_receiver_end_result.try_recv() {
             end_result_record.append(&mut buf);
         }
 

@@ -13,9 +13,9 @@ pub type EpochId = u16;
 pub type InstanceId = u16;
 pub type ClusterId = u16;
 
-/// Messages going into the sequencer server and 
+/// Messages going into the sequencer server and
 /// being sent out by the sequencer
-/// server over the bus are the same structure, 
+/// server over the bus are the same structure,
 /// to make 0-copy behavior possible.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Eq)]
 #[archive(compare(PartialEq))]
