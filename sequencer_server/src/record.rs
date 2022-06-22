@@ -18,7 +18,7 @@ const GROW_BY: usize = 65535;
 
 pub trait MessageRecordBackend: Sized {
     fn init<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error>;
-    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error>;
+    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error>;
     /// How long was this file when we opened it, at the start of this run of
     /// the program?
     fn initial_offset(&self) -> u64;
@@ -111,7 +111,8 @@ impl MessageRecordBackend for MemMapBackend {
         let file_len = file.seek(SeekFrom::End(0))?;
 
         let start_offset = if start_offset > file_len {
-            println!("WARNING: Attempting to start at an offset which the message bus has not reached yet.");
+            println!("WARNING: Attempting to start at an offset which the message bus has not reached yet. Defaulting to end of file.");
+            eprintln!("WARNING: Attempting to start at an offset which the message bus has not reached yet. Defaulting to end of file.");
             file_len
         } else {
             start_offset
@@ -145,7 +146,7 @@ impl MessageRecordBackend for MemMapBackend {
     }
 
     #[inline]
-    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+    fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error> {
         // Length of message payload to append.
         let message_len = message.as_ref().len() as usize;
         assert!(message_len < LengthTag::MAX as usize);
@@ -201,7 +202,7 @@ impl MessageRecordBackend for MemMapBackend {
         self.current_offset = new_record_end;
         self.mmap_cursor += written_len;
 
-        Ok(())
+        Ok(written_len as u64)
     }
     fn initial_offset(&self) -> u64 {
         self.start_offset
@@ -227,8 +228,8 @@ pub mod test_util {
         }
 
         #[allow(unused_variables)]
-        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
-            Ok(())
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error> {
+            Ok(0)
         }
 
         fn initial_offset(&self) -> u64 {
@@ -255,13 +256,13 @@ pub mod test_util {
         }
 
         #[allow(unused_variables)]
-        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error> {
             // Length-prefixing.
             let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
             self.inner.extend_from_slice(&len_bytes);
             // Write message.
             self.inner.extend_from_slice(message.as_ref());
-            Ok(())
+            Ok((len_bytes.len() + message.as_ref().len()) as u64)
         }
 
         fn initial_offset(&self) -> u64 {
@@ -299,11 +300,11 @@ pub mod test_util {
         }
 
         #[allow(unused_variables)]
-        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error> {
             let mut buf_make = Vec::new();
 
             if message.as_ref().is_empty() {
-                return Ok(());
+                return Ok(0);
             }
             // Length-prefixing.
             let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
@@ -315,9 +316,11 @@ pub mod test_util {
             buf_make.extend_from_slice(message.as_ref());
             self.count += message.as_ref().len() as u64;
 
+            let len_written = buf_make.len();
+
             self.sender.send(buf_make).unwrap();
 
-            Ok(())
+            Ok(len_written as u64)
         }
 
         fn initial_offset(&self) -> u64 {

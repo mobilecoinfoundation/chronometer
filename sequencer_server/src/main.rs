@@ -1,11 +1,13 @@
 use bytecheck::StructCheckError;
 use clap::Parser;
+use fxhash::FxHashMap;
 use record::MessageRecordBackend;
 use rkyv::{
     validation::{validators::DefaultValidatorError, CheckArchiveError},
     Archive,
 };
-use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage};
+use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage, EpochId};
+use tokio::sync::broadcast::Receiver;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -13,7 +15,7 @@ use std::{
     net::{Ipv6Addr, SocketAddrV6, UdpSocket},
     path::PathBuf,
     pin::Pin,
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicU64, self}, time::Duration,
 };
 
 pub mod record;
@@ -27,6 +29,12 @@ struct Args {
     pub port: u16,
     #[clap(short = 'p', long = "recordpath")]
     pub record_path: PathBuf,
+    #[clap(short = 'e', long = "epoch", default_value_t = 0)]
+    pub epoch: EpochId,
+    #[clap(short = 'o', long = "start_offset", default_value_t = 0)]
+    pub offset: u64,
+    #[clap(short = 's', long = "start_seq", default_value_t = 0)]
+    pub sequence: u64,
 }
 
 pub type ReadArchiveError = CheckArchiveError<StructCheckError, DefaultValidatorError>;
@@ -140,7 +148,11 @@ struct InboundServer<Record: MessageRecordBackend> {
     pub _total_written: u64,
     /// Last-received sequence numbers per-app.
     /// Used to deduplicate messages.
-    app_sequence_numbers: HashMap<AppId, u64>,
+    /// 
+    /// This is an FxHashMap because the sequencer will always be running 
+    /// inside a VPC, and it shouldn't be ingesting untrusted traffic in 
+    /// general - a firewall is needed. So, hash-dos attacks are not a concern.  
+    app_sequence_numbers: FxHashMap<AppId, u64>,
     /// Underlying storage to which we write our messages.
     pub record: Record,
 }
@@ -149,11 +161,11 @@ impl<Record> InboundServer<Record>
 where
     Record: MessageRecordBackend,
 {
-    pub fn new(port: u16, record: Record) -> InboundServer<Record> {
+    pub fn new(port: u16, record: Record, starting_offset: u64, starting_seq: u64) -> InboundServer<Record> {
         InboundServer {
             port,
-            counter: 0,
-            _total_written: 0,
+            counter: starting_seq,
+            _total_written: starting_offset,
             app_sequence_numbers: HashMap::default(),
             record,
         }
@@ -302,7 +314,8 @@ fn estimate_threads_for_async() -> (usize, usize) {
     // Number of threads reserved for the sequencer
     // (and also possibly the OS depending on what kinds of guesses we want to make
     // here)
-    const RESERVE: usize = 1;
+    // Currently it's the sequencer, the tokio blocking thread and the counter watcher thread. 
+    const RESERVED: usize = 3;
 
     let available_threads: usize = match std::thread::available_parallelism() {
         Ok(val) => val.into(),
@@ -313,12 +326,11 @@ fn estimate_threads_for_async() -> (usize, usize) {
         }
     };
 
-    let non_blocking = if ((available_threads as i64) - (RESERVE as i64) - 1/* for the Tokio blocking thread */)
-        < 1
+    let non_blocking = if (available_threads as i64) - (RESERVED as i64) < 1
     {
         1usize
     } else {
-        ((available_threads as i64) - (RESERVE as i64) - 1) as usize
+        ((available_threads as i64) - (RESERVED as i64)) as usize
     };
 
     (non_blocking, 1)
@@ -333,6 +345,23 @@ fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
     runtime_builder.worker_threads(non_blocking_threads);
 
     runtime_builder.build()
+}
+
+fn offset_watcher_thread(channel_capacity: usize, update_interval: Duration) -> Receiver<u64> { 
+    // Intended to notify all Client-Service processes, which will likely be 
+    let (sender, receiver) = tokio::sync::broadcast::channel(channel_capacity);
+    std::thread::spawn(move || {
+        let mut previous_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
+        loop { 
+            std::thread::sleep(update_interval);
+            let new_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
+            if new_offset > previous_offset { 
+                sender.send(new_offset-previous_offset).unwrap();
+                previous_offset = new_offset;
+            }
+        }
+    });
+    receiver
 }
 
 fn main() -> std::io::Result<()> {
@@ -356,13 +385,18 @@ fn main() -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-
+    
     let _runtime = build_async_runtime().unwrap();
 
-    // TODO: Persist starting offset.
-    let record = record::MemMapBackend::init(path, 0)?;
+    // Load our record file. 
+    let record = record::MemMapBackend::init(path, args.offset)?;
+    // Determine current offset. 
+    let initial_offset = record.initial_offset();
+    CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
 
-    let inbound_server = InboundServer::new(args.port, record);
+    let _offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
+
+    let inbound_server = InboundServer::new(args.port, record, initial_offset, args.sequence);
     inbound_server
         .start()
         .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
@@ -375,11 +409,11 @@ mod test {
     use std::{
         io::Read,
         path::Path,
-        sync::{atomic, Mutex},
+        sync::{atomic, Mutex}, time::Duration,
     };
 
     use crate::record::{
-        test_util::{DummyBackend, MultiPushBackend, VecBackend},
+        test_util::{DummyBackend, VecBackend},
         MemMapBackend,
     };
 
@@ -417,7 +451,7 @@ mod test {
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {});
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, 0);
 
         let server_listener = UdpSocket::bind(server_addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -467,7 +501,7 @@ mod test {
         
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {});
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, 0);
 
         let server_listener = UdpSocket::bind(server_addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -592,6 +626,7 @@ mod test {
     // This is used as the first half of a couple of other tests.
     fn test_record_emit<T: MessageRecordBackend>(
         num_tests: u64,
+        offset_start: u64,
         counter_start: u64,
         record: T,
     ) -> Result<T, Box<dyn std::error::Error>> {
@@ -600,8 +635,8 @@ mod test {
 
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut server = InboundServer::new(server_addr.port(), record);
-        server.counter = counter_start;
+        let mut server = InboundServer::new(server_addr.port(), record, offset_start, counter_start);
+        //server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -667,6 +702,7 @@ mod test {
         let record = test_record_emit(
             NUM_TESTS as u64,
             0,
+            0,
             VecBackend {
                 inner: Vec::default(),
             },
@@ -717,7 +753,7 @@ mod test {
         }
 
         let record = MemMapBackend::init(&path, 0).unwrap();
-        let record = test_record_emit(NUM_TESTS as u64, 0, record).unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, 0, record).unwrap();
 
         // Make sure the file handle gets dropped so we can open it again without
         // clobbering anything.
@@ -776,7 +812,7 @@ mod test {
 
         {
             let record = MemMapBackend::init(&path, 0).unwrap();
-            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0_u64, record).unwrap();
+            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0_u64, 0, record).unwrap();
 
             last_offset = record.record_len();
             // Make sure the file handle gets dropped so we can open it again without
@@ -814,7 +850,7 @@ mod test {
         {
             let record = MemMapBackend::init(&path, last_offset).unwrap();
             let record =
-                test_record_emit(NUM_TESTS_SECOND as u64, NUM_TESTS_INITIAL as u64, record)
+                test_record_emit(NUM_TESTS_SECOND as u64, CURRENT_OFFSET.load(atomic::Ordering::Relaxed), NUM_TESTS_INITIAL as u64, record)
                     .unwrap();
 
             // Make sure the file handle gets dropped so we can open it again without
@@ -897,61 +933,55 @@ mod test {
 
     #[test]
     pub fn test_offset_counter_consistency() {
-        const NUM_TESTS: usize = 32;
         let _guard = IO_TEST_PERMISSIONS.lock();
+        const NUM_TESTS: usize = 32;
         CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+        let record = VecBackend{inner: Vec::new()};
 
-        let record = MultiPushBackend::new(4096);
-        let mut record_receiver = record.sender.subscribe();
-        let mut record_receiver_end_result = record.sender.subscribe();
         let runtime = build_async_runtime().unwrap();
+
+        let mut counter_change_receiver = offset_watcher_thread(4096, Duration::from_millis(1)); 
 
         // Channels
         let (counter_error_sender, mut counter_error_receiver): (
             Sender<TestError>,
             Receiver<TestError>,
         ) = tokio::sync::broadcast::channel(NUM_TESTS);
-        let (continue_clock_sender, mut continue_clock_receiver): (
-            tokio::sync::mpsc::UnboundedSender<()>,
-            tokio::sync::mpsc::UnboundedReceiver<()>,
-        ) = tokio::sync::mpsc::unbounded_channel();
         let (end_test_sender, mut end_test_receiver): (Sender<()>, Receiver<()>) =
             tokio::sync::broadcast::channel(NUM_TESTS);
+
+        let end_test_sender_clone = end_test_sender.clone();
 
         let err_sender_clone = counter_error_sender.clone();
         let mut err_receiver_clone = counter_error_sender.subscribe();
         let mut end_test_receiver_clone = end_test_sender.subscribe();
 
+        // TODO: Find a more graceful, less gross way to do this. 
         // Prevent various race conditions.
         let _end_tester_keepalive = end_test_sender.clone();
-        let _end_receiver_keepalive = end_test_sender.subscribe(); 
-        //Retain the channel even when the record object gets dropped, so the test
+        //Retain the channel even when the server object gets dropped, so the test
         // doesn't error when it's shutting down.
-        let _record_sender_keepalive = record.sender.clone();
+        let _counter_change_keepalive = counter_change_receiver.resubscribe();
+        let _err_sender_keepalive = counter_error_sender.clone();
 
         // Counter-checking task:
         let join_handle_1 = runtime.spawn( async move {
-            let mut prev_counter = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+            let mut prev_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
             loop {
                 tokio::select! {
                     _ = end_test_receiver_clone.recv() => {
                         break;
                     }
-                    buf_maybe = record_receiver.recv() => {
-                        match buf_maybe {
-                            Ok(buf) => {
-                                let new_counter = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+                    len_maybe = counter_change_receiver.recv() => {
+                        match len_maybe {
+                            Ok(new_byte_len) => {
+                                let new_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
 
-                                //println!("The new counter is {} and the old counter is {}", new_counter, prev_counter);
-
-                                //If the counter somehow went down or if it didn't go up... 
-                                if new_counter <= prev_counter { 
-                                    // ...that's an error. 
-                                    err_sender_clone.send(TestError::CounterOutOfStep(prev_counter + buf.len() as u64, new_counter)).unwrap();
+                                if new_offset <= prev_offset { 
+                                    err_sender_clone.send(TestError::CounterOutOfStep(prev_offset + new_byte_len, new_offset)).unwrap();
                                     break;
                                 }
-                                prev_counter = new_counter; 
-                                continue_clock_sender.send(()).unwrap();
+                                prev_offset = new_offset; 
                             }, 
                             Err(_e) => {
                                 err_sender_clone.send(TestError::RecvChannelError).unwrap();
@@ -960,6 +990,7 @@ mod test {
                     },
                 }
             }
+            end_test_sender.send(()).unwrap();
         });
 
         // Message-generating UDP task
@@ -967,7 +998,7 @@ mod test {
             // Start a server
             let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
 
-            let mut server = InboundServer::new(server_addr.port(), record);
+            let mut server = InboundServer::new(server_addr.port(), record, 0, 0);
 
             let server_listener = UdpSocket::bind(server_addr)
                 .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -1040,22 +1071,9 @@ mod test {
                         break;
                     }
                 }
-
-                // Wait for the go-ahead to keep iterating.
-                match continue_clock_receiver
-                    .recv()
-                    .await
-                    .ok_or(TestError::RecvChannelError)
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        counter_error_sender.send(e).unwrap(); //If we can't send errors then we're just done anyway, panic and kill the
-                                                               // task.
-                        break;
-                    }
-                }
             }
-            end_test_sender.send(()).unwrap();
+            end_test_sender_clone.send(()).unwrap();
+            server.into_record()
         });
 
         let resl: Result<(), TestError> = runtime.block_on(async move {
@@ -1063,7 +1081,7 @@ mod test {
                 some_kind_of_err = counter_error_receiver.recv() => {
                     match some_kind_of_err { 
                         Ok(err) => Err(err), 
-                        Err(_e) => Err(TestError::RecvChannelError),
+                        Err(_e) => panic!("Could not receive an error from the error channel."),
                     }
                 }
                 _end = end_test_receiver.recv() => {
@@ -1074,17 +1092,11 @@ mod test {
         });
         resl.unwrap();
         runtime.block_on(join_handle_1).unwrap();
-        runtime.block_on(join_handle_2).unwrap();
+        let record = runtime.block_on(join_handle_2).unwrap();
 
         //Check to see if the number is right.
         let offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
 
-        let mut end_result_record: Vec<u8> = Vec::new();
-
-        while let Ok(mut buf) = record_receiver_end_result.try_recv() {
-            end_result_record.append(&mut buf);
-        }
-
-        assert_eq!(end_result_record.len() as u64, offset);
+        assert_eq!(record.inner.len() as u64, offset);
     }
 }
