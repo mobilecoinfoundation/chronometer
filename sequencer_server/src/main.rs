@@ -6,9 +6,9 @@ use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage};
 use std::{
     collections::HashMap,
     fmt::Display,
-    io::ErrorKind as IoErrorKind,
+    io::{ErrorKind as IoErrorKind, self},
     net::{Ipv6Addr, SocketAddrV6, UdpSocket},
-    pin::Pin, path::PathBuf, sync::atomic::{AtomicU64}, thread,
+    pin::Pin, path::PathBuf, sync::atomic::{AtomicU64}, thread, num::NonZeroUsize,
 };
 
 pub mod record;
@@ -189,7 +189,10 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
     #[inline]
     pub fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> std::result::Result<(), SequencerError> {
         self.record.write_message(message)
-            .map_err(|e| SequencerError::WriteToFile(e))
+            .map_err(|e| SequencerError::WriteToFile(e))?;
+        let offset = self.record.record_len();
+        CURRENT_OFFSET.store(offset, std::sync::atomic::Ordering::Relaxed); // TODO - Should we be using another ordering? 
+        Ok(())
     }
 
     #[inline]
@@ -237,7 +240,7 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
         };
         if message_maybe.is_some() {
             drop(message_maybe);
-            if message_len > 0 { 
+            if message_len > 0 {
                 self.write_message(&recv_buffer[0..message_len as usize])?;
             }
         }
@@ -266,6 +269,43 @@ impl<Record> InboundServer<Record> where Record: MessageRecordBackend {
     }
 }
 
+/// How many worker threads can we safely spin up 
+/// without fighting with the sequencer thread for cycles? 
+/// Returns (non_blocking, blocking) 
+fn estimate_threads_for_async() -> (usize, usize) {
+    // Number of threads reserved for the sequencer 
+    // (and also possibly the OS depending on what kinds of guesses we want to make here)
+    const RESERVE: usize = 1; 
+    
+    let available_threads: usize = match std::thread::available_parallelism() { 
+        Ok(val) => val.into(), 
+        Err(e) => {
+            eprintln!("Unable to get a count of available threads from the OS, defaulting to 1. Error was: {:?}", e);
+            eprintln!("Unable to get a count of available threads from the OS, defaulting to 1. Error was: {:?}", e);
+            1
+        }
+    };
+
+    let non_blocking = if ((available_threads as i64) - (RESERVE as i64) - 1 /* for the Tokio blocking thread */) < 1 { 
+        1usize
+    } else { 
+        ( (available_threads as i64) - (RESERVE as i64) - 1 ) as usize
+    };
+
+    (non_blocking, 1)
+}
+
+fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
+    let (non_blocking_threads, blocking_threads) = estimate_threads_for_async(); 
+    println!("Initializing Tokio runtime with {} async worker threads and {} blocking threads provided to it.", non_blocking_threads, blocking_threads); 
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    runtime_builder.max_blocking_threads(blocking_threads);
+    runtime_builder.worker_threads(non_blocking_threads);
+
+    runtime_builder.build()
+}
+
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
@@ -288,6 +328,8 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    let _runtime = build_async_runtime().unwrap(); 
+
     // TODO: Persist starting offset.
     let record = record::MemMapBackend::init(path, 0)?;
 
@@ -302,10 +344,11 @@ fn main() -> std::io::Result<()> {
 mod test {
     use std::{io::Read, path::Path, sync::Mutex};
 
-    use crate::record::{test_util::{DummyBackend, VecBackend}, MemMapBackend};
+    use crate::record::{test_util::{DummyBackend, VecBackend, MultiPushBackend}, MemMapBackend};
 
     use super::*;
     use lazy_static::lazy_static;
+    use tokio::sync::broadcast::{Sender, Receiver};
 
     // Any localhost-related network tests will interfere with eachother if you use
     // the cargo test command, which is multithreaded by default.
@@ -662,6 +705,7 @@ mod test {
         }
         #[allow(unused_assignments)]
         let mut last_offset = 0;
+
         { 
             let record = MemMapBackend::init(&path, 0).unwrap();
             let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0 as u64, record).unwrap();
@@ -726,4 +770,30 @@ mod test {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
     }
+
+    /*
+    #[test]
+    pub fn test_watch_counter() {
+        const NUM_TESTS: usize = 32;
+        let _guard = IO_TEST_PERMISSIONS.lock();
+        
+        let mut record = MultiPushBackend::new(4096);
+        let mut receiver = record.sender.subscribe(); 
+    
+        let mut runtime = build_async_runtime().unwrap();
+
+        let (counter_error_sender, counter_error_receiver): (Sender<(u64, u64)>, Receiver<(u64, u64)>) = tokio::sync::broadcast::channel(256);
+        
+        runtime.spawn( async move {
+            let mut prev_counter = 0; 
+            for _i in 0..NUM_TESTS { 
+                match receiver.recv().await { 
+                    Ok(_) => { 
+                        if 
+                    }
+                    Err(_) => todo!(),
+                }
+            }
+        });
+    }*/
 }

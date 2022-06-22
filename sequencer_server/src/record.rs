@@ -251,4 +251,45 @@ pub mod test_util {
         }
     }
 
+    pub struct MultiPushBackend {
+        pub sender: tokio::sync::broadcast::Sender<Vec<u8>>,
+        pub receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+        pub count: u64,
+    }
+
+    impl MultiPushBackend { 
+        pub fn new(capacity: usize) -> Self { 
+            let (sender, receiver) = tokio::sync::broadcast::channel(capacity);
+            MultiPushBackend { 
+                sender,
+                receiver,
+                count: 0,
+            }
+        }
+    }
+
+    impl MessageRecordBackend for MultiPushBackend {
+        #[allow(unused_variables)]
+        fn init<T: AsRef<std::path::Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> {
+            Ok(MultiPushBackend::new(4096))
+        }
+
+        #[allow(unused_variables)]
+        fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+            // Length-prefixing.
+            let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
+            self.sender.send(len_bytes.to_vec()).unwrap();
+            self.count += len_bytes.len() as u64;
+            // Write message.
+            self.sender.send(message.as_ref().to_vec()).unwrap();
+            self.count += message.as_ref().len() as u64;
+            Ok(())
+        }
+
+        fn initial_offset(&self) -> u64 { 0 }
+        fn record_len(&self) -> u64 {
+            self.count
+        }
+    }
+
 }
