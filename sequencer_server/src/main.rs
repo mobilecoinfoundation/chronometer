@@ -342,7 +342,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use std::{io::Read, path::Path, sync::Mutex};
+    use std::{io::Read, path::Path, sync::{Mutex, atomic}};
 
     use crate::record::{test_util::{DummyBackend, VecBackend, MultiPushBackend}, MemMapBackend};
 
@@ -361,6 +361,8 @@ mod test {
 
     #[test]
     fn test_stream_received() {
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
+        let _guard = IO_TEST_PERMISSIONS.lock();
         use rkyv::Deserialize;
 
         // Prevent tests from interfering with eachother over the localhost connection.
@@ -417,6 +419,7 @@ mod test {
 
     #[test]
     fn test_counter() {
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
 
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
@@ -614,6 +617,7 @@ mod test {
 
     #[test]
     fn record_vec() {
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
         const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock();
         let record = test_record_emit(NUM_TESTS as u64, 0, VecBackend{inner: Vec::default()}).unwrap();
@@ -639,6 +643,7 @@ mod test {
 
     #[test]
     fn record_mmap_file() {
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
         const NUM_TESTS: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock();
 
@@ -689,6 +694,7 @@ mod test {
 
     #[test]
     fn multiple_sessions_mmap_file() {
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
         const NUM_TESTS_INITIAL: usize = 32; 
         let _guard = IO_TEST_PERMISSIONS.lock();
 
@@ -769,31 +775,222 @@ mod test {
         //Clean up 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
+    }
+    
+    #[derive(Debug, Clone)]
+    enum TestError { 
+        CounterOutOfStep(u64, u64), 
+        RecvChannelError,
+        SendChannelError,
+        RecvUdpError(String),
+        SendUdpErr(String),
+        BindUdpErr(String),
+        SequencerErr(String),
     }
 
-    /*
-    #[test]
-    pub fn test_watch_counter() {
-        const NUM_TESTS: usize = 32;
-        let _guard = IO_TEST_PERMISSIONS.lock();
-        
-        let mut record = MultiPushBackend::new(4096);
-        let mut receiver = record.sender.subscribe(); 
-    
-        let mut runtime = build_async_runtime().unwrap();
+    impl Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TestError::CounterOutOfStep(expected, actual) => write!(
+                    f,
+                    "The counter did not increase monotonically! We expected the counter to be at {} and instead it was {}",
+                    expected,
+                    actual,
+                ),
+                TestError::RecvChannelError => write!(
+                    f,
+                    "Error receiving on a message-passing channel"
+                ),
+                TestError::SendChannelError => write!(
+                    f,
+                    "Error sending on a message-passing channel"
+                ),
+                TestError::RecvUdpError(underlying) => write!(
+                    f,
+                    "Error receiving UDP packet: {}",
+                    underlying,
+                ),
+                TestError::SendUdpErr(underlying) => write!(
+                    f,
+                    "Error sending UDP packet: {}",
+                    underlying,
+                ),
+                TestError::BindUdpErr(underlying) => write!(
+                    f,
+                    "Error binding to UDP socket: {}",
+                    underlying,
+                ),
+                TestError::SequencerErr(err) => write!(
+                    f,
+                    "Sequencer logic error: {}",
+                    err,
+                ),
+            }
+        }
+    }
+    impl std::error::Error for TestError {}
 
-        let (counter_error_sender, counter_error_receiver): (Sender<(u64, u64)>, Receiver<(u64, u64)>) = tokio::sync::broadcast::channel(256);
+    #[test]
+    pub fn test_offset_counter_consistency() {
+        const NUM_TESTS: usize = 32;
+        let guard = IO_TEST_PERMISSIONS.lock();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed); 
         
-        runtime.spawn( async move {
-            let mut prev_counter = 0; 
-            for _i in 0..NUM_TESTS { 
-                match receiver.recv().await { 
-                    Ok(_) => { 
-                        if 
+        let record = MultiPushBackend::new(4096);
+        let mut record_receiver = record.sender.subscribe();
+        let mut record_receiver_end_result = record.sender.subscribe();
+        //Retain the channel even when the record object gets dropped, so the test doesn't error when it's shutting down.
+        let _record_sender_keepalive = record.sender.clone();
+    
+        let runtime = build_async_runtime().unwrap();
+
+        // Channels
+        let (counter_error_sender, mut counter_error_receiver): (Sender<TestError>, Receiver<TestError>) = tokio::sync::broadcast::channel(NUM_TESTS);
+        let (continue_clock_sender, mut continue_clock_receiver): (tokio::sync::mpsc::UnboundedSender<()>, tokio::sync::mpsc::UnboundedReceiver<()>) = tokio::sync::mpsc::unbounded_channel();
+        let (end_test_sender, mut end_test_receiver): (Sender<()>, Receiver<()>) = tokio::sync::broadcast::channel(NUM_TESTS);
+
+        let err_sender_clone = counter_error_sender.clone();
+        let mut err_receiver_clone = counter_error_sender.subscribe();
+        let mut end_test_receiver_clone = end_test_sender.subscribe();
+
+        // Counter-checking task:
+        let join_handle_1 = runtime.spawn( async move {
+            let mut prev_counter = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    _ = end_test_receiver_clone.recv() => {
+                        break;
                     }
-                    Err(_) => todo!(),
+                    buf_maybe = record_receiver.recv() => {
+                        match buf_maybe {
+                            Ok(buf) => {
+                                let new_counter = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+
+                                //println!("The new counter is {} and the old counter is {}", new_counter, prev_counter);
+
+                                //If the counter somehow went down or if it didn't go up... 
+                                if new_counter <= prev_counter { 
+                                    // ...that's an error. 
+                                    err_sender_clone.send(TestError::CounterOutOfStep(prev_counter + buf.len() as u64, new_counter)).unwrap();
+                                    break;
+                                }
+                                prev_counter = new_counter; 
+                                continue_clock_sender.send(()).unwrap();
+                            }, 
+                            Err(_e) => {
+                                err_sender_clone.send(TestError::RecvChannelError).unwrap();
+                            }
+                        }
+                    },
                 }
             }
         });
-    }*/
+
+        // Message-generating UDP task
+        let join_handle_2 = runtime.spawn( async move {
+            // Start a server
+            let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
+            
+            let mut server = InboundServer::new(server_addr.port(), record);
+
+            let server_listener = UdpSocket::bind(server_addr)
+                .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e))).unwrap();
+
+            let mut recv_buffer = vec![0u8; 2048];
+
+            for i in 0..NUM_TESTS {
+                //println!("Sending message {}", i);
+                // Dummy message for testing.
+                let example_message = format!("Hello, world! This is message #{}", i);
+                let payload = example_message.as_bytes().to_vec();
+                // Build an archive
+                let mut input = SequencerMessage::new(1 as AppId, 1, 2, i as u64, payload);
+                // Give it some stupid garbage as its sequence number, so we can be sure the server overwrites it.
+                input.sequence_number = u64::MAX;
+                //Serialize.
+                let data = rkyv::to_bytes::<_, 256>(&input).expect("failed to serialize");
+
+                // Start a client
+                let client_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                let client = match UdpSocket::bind(&client_addr) { 
+                    Ok(client) => client, 
+                    Err(e) => { 
+                        counter_error_sender.send(TestError::BindUdpErr(format!("{:?}", e))).unwrap();
+                        break;
+                    },
+                };
+
+                // Send the archive
+                match client.send_to(&data, &server_addr) {
+                    Ok(_) => {},
+                    Err(e) => { 
+                        counter_error_sender.send(TestError::SendUdpErr(format!("{:?}", e))).unwrap();
+                        break;
+                    },
+                }
+        
+                // Receive.
+                match server.step(&server_listener, &mut recv_buffer) { 
+                    Ok(()) => {}, 
+                    Err(e) => { 
+                        counter_error_sender.send( TestError::SequencerErr(format!("{:?}", e)) ).unwrap();
+                    }
+                }
+
+                // Was the test ended by an error elsewhere? If so, break out of the loop.
+                match err_receiver_clone.try_recv() {
+                    Ok(inner_error) => { 
+                        println!("Ending test message-sending thread due to error: {:?}", inner_error);
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        /* No error yet, do nothing */
+                    }
+                    Err(_) => { 
+                        println!("Cannot receive on error channel, it must have no senders remaining.");
+                        break;
+                    }
+                    _ => {}
+                }
+
+                // Wait for the go-ahead to keep iterating.
+                match continue_clock_receiver.recv().await.ok_or(TestError::RecvChannelError) {
+                    Ok(()) => {},
+                    Err(e) => { 
+                        counter_error_sender.send(e).unwrap(); //If we can't send errors then we're just done anyway, panic and kill the task.
+                        break;
+                    },
+                }
+            }
+            end_test_sender.send(()).unwrap();
+        });
+
+        let resl: Result<(), TestError> = runtime.block_on( async move { 
+            tokio::select! { 
+                err = counter_error_receiver.recv() => { 
+                    let err = err.unwrap();
+                    Err(err)
+                }
+                _end = end_test_receiver.recv() => { 
+                    //Test completed successfully, there are no problems. 
+                    Ok(())
+                }
+            }
+        });
+        resl.unwrap();
+        runtime.block_on(join_handle_1).unwrap();
+        runtime.block_on(join_handle_2).unwrap();
+
+        //Check to see if the number is right. 
+        let offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+
+        let mut end_result_record: Vec<u8> = Vec::new();
+
+        while let Ok(mut buf) = record_receiver_end_result.try_recv() { 
+            end_result_record.append(&mut buf);
+        }
+
+        assert_eq!(end_result_record.len() as u64, offset);
+    }
 }

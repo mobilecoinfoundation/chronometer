@@ -276,13 +276,23 @@ pub mod test_util {
 
         #[allow(unused_variables)]
         fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<(), std::io::Error> {
+            let mut buf_make = Vec::new();
+
+            if message.as_ref().len() == 0 { 
+                return Ok(());
+            }
             // Length-prefixing.
             let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
-            self.sender.send(len_bytes.to_vec()).unwrap();
+
+            // Write message.
+            buf_make.extend_from_slice(&len_bytes);
             self.count += len_bytes.len() as u64;
             // Write message.
-            self.sender.send(message.as_ref().to_vec()).unwrap();
+            buf_make.extend_from_slice(message.as_ref());
             self.count += message.as_ref().len() as u64;
+
+            self.sender.send(buf_make).unwrap();
+
             Ok(())
         }
 
