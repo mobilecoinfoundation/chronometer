@@ -1,22 +1,24 @@
 use bytecheck::StructCheckError;
 use clap::Parser;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap};
 use record::MessageRecordBackend;
 use rkyv::{
     validation::{validators::DefaultValidatorError, CheckArchiveError},
     Archive,
 };
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage, EpochId};
-use tokio::{sync::broadcast::Receiver, io::{AsyncReadExt, AsyncWriteExt}};
+use tokio::{sync::broadcast::Receiver, io::{AsyncReadExt}};
 use std::{
     collections::HashMap,
     fmt::Display,
     io::{self, ErrorKind as IoErrorKind},
     net::{Ipv6Addr, SocketAddrV6, UdpSocket, IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{PathBuf},
     pin::Pin,
     sync::atomic::{AtomicU64, self}, time::Duration, str::FromStr,
 };
+
+use crate::record::MemMapRecordReader;
 
 pub mod record;
 
@@ -29,7 +31,7 @@ struct Args {
     pub port: u16,
     #[clap(short, long)]
     pub address: String,
-    #[clap(short = 'p', long = "recordpath")]
+    #[clap(long = "record_path")]
     pub record_path: PathBuf,
     #[clap(short = 'e', long = "epoch", default_value_t = 0)]
     pub epoch: EpochId,
@@ -352,7 +354,10 @@ fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
 fn offset_watcher_thread(channel_capacity: usize, update_interval: Duration) -> Receiver<u64> { 
     // Intended to notify all Client-Service processes, which will likely be 
     let (sender, receiver) = tokio::sync::broadcast::channel(channel_capacity);
+    //Prevent spurious errors on shutdown.
+    let _receiver_keepalive = receiver.resubscribe();
     std::thread::spawn(move || {
+        let _receiver_keepalive = _receiver_keepalive;
         let mut previous_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
         loop { 
             std::thread::sleep(update_interval);
@@ -364,6 +369,51 @@ fn offset_watcher_thread(channel_capacity: usize, update_interval: Duration) -> 
         }
     });
     receiver
+}
+
+async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String, tcp_port: u16, path: PathBuf, offset_change_receiver: Receiver<u64>) { 
+    let address = match IpAddr::from_str(&un_parsed_address) {
+        Ok(addr) => SocketAddr::from((addr, tcp_port)),
+        Err(_parse_err) => match tokio::net::lookup_host(&un_parsed_address).await { 
+            Ok(mut addrs) => { 
+                SocketAddr::from((addrs.next().unwrap().ip(), tcp_port))
+            }, 
+            Err(lookup_err) => { 
+                panic!("Failed to parse {} as an IP address - when assuming it was a URL, DNS lookup failed with, {:?}", &un_parsed_address, lookup_err) 
+            }
+        },
+    };
+
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    //Make sure the closure captures it before borrowing it off into another closure.
+    let offset_change_receiver = offset_change_receiver;
+    let reader_path = path.clone();
+    loop {
+        let (mut socket, _peer_addr) = listener.accept().await.unwrap();
+        let mut local_change_receiver = offset_change_receiver.resubscribe();
+        let reader_path = reader_path.clone();
+        tokio::spawn(async move {
+            let mut read_buf = [0u8; 4096];
+            let (mut reader, mut writer) = socket.split();
+            let mut _subscribed_app_ids: Vec<AppId> = Vec::default();
+            let mut last_sent_offset = initial_offset;
+            loop { 
+                tokio::select! {
+                    _new_bytes = local_change_receiver.recv() => {
+                        let current_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+                        // Time does not go backwards
+                        assert!(current_offset > last_sent_offset);
+                        let mut file_reader = MemMapRecordReader::new(&reader_path, last_sent_offset).unwrap();
+                        file_reader.read_and_push_to(&_subscribed_app_ids, &mut writer).await.unwrap();
+                        last_sent_offset = file_reader.most_recent_offset_visited();
+                    }
+                    _len_read = reader.read(&mut read_buf) => { 
+                        //Todo: Read inbound messages
+                    }
+                }
+            }
+        });
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -391,7 +441,7 @@ fn main() -> std::io::Result<()> {
     let runtime = build_async_runtime().unwrap();
 
     // Load our record file. 
-    let record = record::MemMapBackend::init(path, args.offset)?;
+    let record = record::MemMapBackend::init(&path, args.offset)?;
     // Determine current offset. 
     let initial_offset = record.initial_offset();
     CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
@@ -401,41 +451,12 @@ fn main() -> std::io::Result<()> {
     let tcp_addr = args.address.clone();
     let tcp_port = args.port; 
 
-    runtime.spawn(async move {
-        let address = match IpAddr::from_str(&tcp_addr) {
-            Ok(addr) => SocketAddr::from((addr, tcp_port)),
-            Err(parse_err) => match tokio::net::lookup_host(&tcp_addr).await { 
-                Ok(mut addrs) => { 
-                    SocketAddr::from((addrs.next().unwrap().ip(), tcp_port))
-                }, 
-                Err(lookup_err) => { 
-                    panic!("Failed to parse {} as an IP address - when assuming it was a URL, DNS lookup failed with, {:?}", &tcp_addr, lookup_err) 
-                }
-            },
-        };
+    let reader_path = path.clone();
 
-        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-        //Make sure the closure captures it before borrowing it off into another closure.
-        let offset_change_receiver = offset_change_receiver;
-        loop {
-            let (mut socket, _peer_addr) = listener.accept().await.unwrap();
-            let mut local_change_receiver = offset_change_receiver.resubscribe();
-            tokio::spawn(async move {
-                let mut read_buf = [0u8; 4096];
-                let (mut reader, mut writer) = socket.split();
-                loop { 
-                    tokio::select! {
-                        new_bytes = local_change_receiver.recv() => { 
-                            //Todo: Read from mem-mapped file, send off new messages to subscribers.
-                        }
-                        len_read = reader.read(&mut read_buf) => { 
-                            //Todo: Read inbound messages
-                        }
-                    }
-                }
-            });
-        }
-    });
+    runtime.spawn(run_client_service_tasks(initial_offset, tcp_addr, tcp_port, reader_path, offset_change_receiver));
+
+    // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
+    std::thread::sleep(Duration::from_millis(5));
 
     let inbound_server = InboundServer::new(args.port, record, initial_offset, args.sequence);
     inbound_server
@@ -459,7 +480,8 @@ mod test {
 
     use super::*;
     use lazy_static::lazy_static;
-    use tokio::sync::broadcast::{Receiver, Sender};
+    use sequencer_common::LengthTag;
+    use tokio::{sync::broadcast::{Receiver, Sender}, net::TcpStream};
 
     // Any localhost-related network tests will interfere with eachother if you use
     // the cargo test command, which is multithreaded by default.
@@ -718,16 +740,16 @@ mod test {
         let mut messages: Vec<Vec<u8>> = Vec::default();
         let mut cursor = 0_usize;
         while cursor < data.as_ref().len() {
-            let mut length_tag_bytes = [0u8; record::LENGTH_TAG_LEN];
+            let mut length_tag_bytes = [0u8; std::mem::size_of::<LengthTag>()];
             length_tag_bytes
-                .copy_from_slice(&data.as_ref()[cursor..cursor + record::LENGTH_TAG_LEN]);
-            let length = record::LengthTag::from_le_bytes(length_tag_bytes) as usize;
+                .copy_from_slice(&data.as_ref()[cursor..cursor + std::mem::size_of::<LengthTag>()]);
+            let length = LengthTag::from_le_bytes(length_tag_bytes) as usize;
             if length == 0 {
                 break;
             }
-            assert!(cursor + record::LENGTH_TAG_LEN + length <= data.as_ref().len());
+            assert!(cursor + std::mem::size_of::<LengthTag>() + length <= data.as_ref().len());
 
-            cursor += record::LENGTH_TAG_LEN;
+            cursor += std::mem::size_of::<LengthTag>();
             messages.push((&data.as_ref()[cursor..cursor + length]).to_vec());
             cursor += length;
         }
@@ -756,12 +778,6 @@ mod test {
         assert_eq!(messages.len(), NUM_TESTS);
 
         for (i, message) in messages.iter().enumerate() {
-            println!(
-                "Message {} is {} bytes: {}",
-                i,
-                message.len(),
-                hex::encode_upper(&message)
-            );
             let converted = String::from_utf8_lossy(message);
             let expected_message = format!("Hello, world! This is message #{}", i);
             assert!(converted.contains(&expected_message));
@@ -809,12 +825,6 @@ mod test {
         assert_eq!(messages.len(), NUM_TESTS);
 
         for (i, message) in messages.iter().enumerate() {
-            println!(
-                "Message {} is {} bytes: {}",
-                i,
-                message.len(),
-                hex::encode_upper(&message)
-            );
             let converted = String::from_utf8_lossy(message);
             let expected_message = format!("Hello, world! This is message #{}", i);
             assert!(converted.contains(&expected_message));
@@ -869,12 +879,6 @@ mod test {
             assert_eq!(messages.len(), NUM_TESTS_INITIAL);
 
             for (i, message) in messages.iter().enumerate() {
-                println!(
-                    "Message {} is {} bytes: {}",
-                    i,
-                    message.len(),
-                    hex::encode_upper(&message)
-                );
                 let converted = String::from_utf8_lossy(message);
                 let expected_message = format!("Hello, world! This is message #{}", i);
                 assert!(converted.contains(&expected_message));
@@ -907,12 +911,6 @@ mod test {
             assert_eq!(messages.len(), NUM_TESTS_INITIAL + NUM_TESTS_SECOND);
 
             for (i, message) in messages.iter().enumerate() {
-                println!(
-                    "Message {} is {} bytes: {}",
-                    i,
-                    message.len(),
-                    hex::encode_upper(&message)
-                );
                 let converted = String::from_utf8_lossy(message);
                 let expected_message = format!("Hello, world! This is message #{}", i);
                 assert!(converted.contains(&expected_message));
@@ -980,7 +978,7 @@ mod test {
 
         let runtime = build_async_runtime().unwrap();
 
-        let mut counter_change_receiver = offset_watcher_thread(4096, Duration::from_millis(1)); 
+        let mut counter_change_receiver = offset_watcher_thread(4096, Duration::from_millis(1));
 
         // Channels
         let (counter_error_sender, mut counter_error_receiver): (
@@ -1138,5 +1136,97 @@ mod test {
         let offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
 
         assert_eq!(record.inner.len() as u64, offset);
+    }
+    #[test] 
+    fn end_to_end_no_appid() { 
+        let _guard = IO_TEST_PERMISSIONS.lock();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
+        const NUM_TESTS: usize = 32;
+
+        //Ignore if it already exists.
+        #[allow(unused_must_use)]
+        {
+            std::fs::create_dir(Path::new("test_output/"));
+        }
+        let path = Path::new("test_output/messagebus");
+        // If a test failed, clean up after it.
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let runtime = build_async_runtime().unwrap();
+
+        // Load our record file. 
+        let record = record::MemMapBackend::init(&path, 0).unwrap();
+        // Determine current offset. 
+        let initial_offset = record.initial_offset();
+        CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
+
+        let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
+        
+
+        let tcp_server_addr = IpAddr::from(Ipv6Addr::LOCALHOST);
+        let tcp_server_port = 9999; 
+
+        let reader_path = path.clone();
+
+        runtime.spawn(run_client_service_tasks(initial_offset, format!("{}", tcp_server_addr), tcp_server_port, reader_path.to_path_buf(), offset_change_receiver));
+        
+        // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
+        std::thread::sleep(Duration::from_millis(5));
+
+        let client_join_handle = runtime.spawn( async move{
+            let mut tcp_stream = TcpStream::connect(SocketAddr::from((tcp_server_addr, tcp_server_port))).await.unwrap();
+            let mut running_tally: Vec<Vec<u8>> = Vec::new();
+            let mut total_bytes_received = 0;
+            let mut num_messages_received = 0;
+            loop {
+                if num_messages_received >= NUM_TESTS { 
+                    break;
+                }
+                let read_resl = tcp_stream.read_u16().await;
+                let length_tag = read_resl.unwrap();
+                if length_tag != 0  { 
+                    let mut message_buf = vec![0u8; length_tag as usize]; 
+                    total_bytes_received += std::mem::size_of::<LengthTag>();
+                    tcp_stream.read_exact(&mut message_buf).await.unwrap(); 
+                    total_bytes_received += message_buf.len();
+                    running_tally.push(message_buf);
+                    num_messages_received += 1; 
+                }
+            }
+            (running_tally, total_bytes_received)
+        }); 
+
+        let record = MemMapBackend::init(&path, 0).unwrap();
+        //Actually push our messages. 
+        let record = test_record_emit(NUM_TESTS as u64, 0_u64, 0, record).unwrap();
+        //Test is done, check results. 
+        let len_wrote = record.record_len();
+        println!("Record thinks file len is {} and actual inner record len is {}", record.get_file_len(), len_wrote);
+        drop(record);
+
+        
+        let mut file_reader = MemMapRecordReader::new(&path, 0).unwrap();
+        let all_messages = file_reader.read_all().unwrap();
+        //Give it a moment to be done.
+        let (running_tally, total_bytes_received) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), client_join_handle).await
+        }).unwrap().unwrap();
+
+        println!("File contains {} messages and the client service received {} messages.", all_messages.len(), running_tally.len());
+        assert_eq!(all_messages.len(), running_tally.len());
+
+        println!("Recorder wrote {} bytes and the client service got {} bytes.", len_wrote, total_bytes_received);
+        assert_eq!(total_bytes_received as u64, len_wrote);
+
+        println!("Checking to see if what was sent by the message bus and received by the client service are byte-for-byte identical");
+        for (i, message) in all_messages.iter().enumerate() {
+            assert_eq!(message, running_tally.get(i).unwrap());
+        }
+        
+        //Clean up
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(Path::new("test_output/")).unwrap();
+        CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
     }
 }
