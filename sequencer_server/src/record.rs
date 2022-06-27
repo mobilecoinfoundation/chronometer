@@ -380,7 +380,7 @@ impl MemMapRecordReader {
             if app_ids.is_empty() { 
                 // No whitelist, match all. 
                 // Length tag 
-                writer.write_u16(message.len() as u16).await?;
+                writer.write_u16_le(message.len() as u16).await?;
                 // Write the message.
                 writer.write_all(message).await?;
             }
@@ -393,7 +393,7 @@ impl MemMapRecordReader {
                 };
                 if app_ids.contains(&data.app_id) { 
                     // Length tag 
-                    writer.write_u16(message.len() as u16).await?;
+                    writer.write_u16_le(message.len() as u16).await?;
                     // Write the message.
                     writer.write_all(message).await?;
                 }

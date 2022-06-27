@@ -1183,9 +1183,9 @@ mod test {
                 if num_messages_received >= NUM_TESTS { 
                     break;
                 }
-                let read_resl = tcp_stream.read_u16().await;
+                let read_resl = tcp_stream.read_u16_le().await;
                 let length_tag = read_resl.unwrap();
-                if length_tag != 0  { 
+                if length_tag != 0 {
                     let mut message_buf = vec![0u8; length_tag as usize]; 
                     total_bytes_received += std::mem::size_of::<LengthTag>();
                     tcp_stream.read_exact(&mut message_buf).await.unwrap(); 
