@@ -205,4 +205,106 @@ mod test {
             assert!(reader.read_message().is_err());
         }
     }
+
+    #[test]
+    fn test_partial() {
+        // open temp file
+        let test_file = NamedTempFile::new().unwrap();
+        let mut write_end = test_file.reopen().unwrap();
+        let mut reader = BlockingConsumer::new(test_file.path());
+
+        let mut messages = vec![];
+
+        for _ in 0..10 {
+            // generate random message
+            let message = SequencerMessage::new(
+                random(),
+                random(),
+                random(),
+                random(),
+                (0..CHUNK_SIZE).map(|_| random()).collect(),
+            );
+            messages.push(message);
+        }
+
+        for message in messages {
+            // archive message
+            let bytes = rkyv::to_bytes::<_, 256>(&message).unwrap();
+
+            assert!(reader.read_message().is_err());
+
+            // write length as bigendian
+            write_end
+                .write_u64::<NetworkEndian>(bytes.len() as u64)
+                .unwrap();
+            write_end.sync_all().unwrap();
+
+            assert!(reader.read_message().is_err());
+
+            // write half the archive
+            write_end.write(&bytes[..(CHUNK_SIZE / 2)]).unwrap();
+            write_end.sync_all().unwrap();
+
+            assert!(reader.read_message().is_err());
+
+            // write other half
+            write_end.write(&bytes[(CHUNK_SIZE / 2)..]).unwrap();
+            write_end.sync_all().unwrap();
+
+            // read from BlockingConsumer
+            let read_message = reader.read_message().unwrap();
+
+            // check for equality
+            assert!(*read_message == message);
+
+            assert!(reader.read_message().is_err());
+        }
+    }
+
+    #[test]
+    fn test_buffered() {
+        // open temp file
+        let test_file = NamedTempFile::new().unwrap();
+        let mut write_end = test_file.reopen().unwrap();
+        let mut reader = BlockingConsumer::new(test_file.path());
+
+        let mut messages = vec![];
+
+        for _ in 0..10 {
+            // generate random message
+            let message = SequencerMessage::new(
+                random(),
+                random(),
+                random(),
+                random(),
+                (0..CHUNK_SIZE).map(|_| random()).collect(),
+            );
+            messages.push(message);
+        }
+
+        for message in &messages {
+            // archive message
+            let bytes = rkyv::to_bytes::<_, 256>(message).unwrap();
+
+            // write length as bigendian
+            write_end
+                .write_u64::<NetworkEndian>(bytes.len() as u64)
+                .unwrap();
+
+            // write archive
+            write_end.write(&bytes).unwrap();
+        }
+
+        write_end.sync_all().unwrap();
+
+        for message in messages {
+            // read from BlockingConsumer
+            let read_message = reader.read_message().unwrap();
+
+            // check for equality
+            assert!(*read_message == message);
+        }
+
+        assert!(reader.read_message().is_err());
+    }
 }
