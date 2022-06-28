@@ -13,9 +13,12 @@ pub type EpochId = u16;
 pub type InstanceId = u16;
 pub type ClusterId = u16;
 
-/// Messages going into the sequencer server and being sent out by the sequencer
-/// server over the bus are the same structure, to make 0-copy behavior
-/// possible.
+pub type LengthTag = u16;
+
+/// Messages going into the sequencer server and
+/// being sent out by the sequencer
+/// server over the bus are the same structure,
+/// to make 0-copy behavior possible.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Eq)]
 #[archive(compare(PartialEq))]
 #[archive_attr(derive(CheckBytes, Debug))]
@@ -58,7 +61,7 @@ impl SequencerMessage {
 impl ArchivedSequencerMessage {
     #[inline(always)]
     // This is the pin projection from SequencerMessage -> sequence_number
-    pub fn with_sequence_number(self: Pin<&mut Self>, value: u64) -> Pin<&mut Self> {
+    pub fn modify_sequence_number(self: Pin<&mut Self>, value: u64) -> Pin<&mut Self> {
         // Sequence number is not a reference type and does not contain any reference
         // types, so this unsafe block *should* be good here.
         unsafe {

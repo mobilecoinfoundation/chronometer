@@ -1,1 +1,4 @@
 /target
+/test_output
+/sequencer_server/test_output
+messagebus
