@@ -383,7 +383,7 @@ impl MemMapRecordReader {
         writer: &mut W,
     ) -> Result<u64, MmapReadError> {
         let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize..]);
-        while let Some(maybe_message) = reader.next() {
+        for maybe_message in reader.by_ref() {
             let message = maybe_message?;
 
             if app_ids.is_empty() {
@@ -414,7 +414,7 @@ impl MemMapRecordReader {
     pub fn read_all(&mut self) -> Result<Vec<Vec<u8>>, MmapReadError> {
         let mut all_messages = Vec::new();
         let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize..]);
-        while let Some(maybe_message) = reader.next() {
+        for maybe_message in reader.by_ref() {
             let message = maybe_message?;
             all_messages.push(message.to_vec());
         }

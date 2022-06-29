@@ -287,11 +287,8 @@ where
                 }
             },
         };
-        if message_maybe.is_some() {
-            drop(message_maybe);
-            if message_len > 0 {
-                self.write_message(&recv_buffer[0..message_len as usize])?;
-            }
+        if message_maybe.is_some() && message_len > 0 {
+            self.write_message(&recv_buffer[0..message_len as usize])?;
         }
         Ok(())
     }
@@ -465,13 +462,11 @@ fn main() -> std::io::Result<()> {
     let tcp_addr = args.address.clone();
     let tcp_port = args.port;
 
-    let reader_path = path.clone();
-
     runtime.spawn(run_client_service_tasks(
         initial_offset,
         tcp_addr,
         tcp_port,
-        reader_path,
+        path,
         offset_change_receiver,
     ));
 
