@@ -2,7 +2,7 @@ use nix::sys::mman::{mmap, mremap, MRemapFlags, MapFlags, ProtFlags};
 use rkyv::check_archived_root;
 use std::{ffi::c_void, fs::File, os::unix::io::AsRawFd, path::Path, slice};
 
-use sequencer_common::{ArchivedSequencerMessage, SequencerMessage};
+use sequencer_common::{ArchivedSequencerMessage, LengthTag, SequencerMessage};
 
 #[derive(Debug, Clone, Copy)]
 pub enum IODaemonError {
@@ -139,20 +139,22 @@ impl<'a> BlockingConsumer<'a> {
         // read length
         // we have to do this instead of just handling read's return because of
         // rustc#54663
-        let len_slice = self.peek(8)?;
-        let len = u64::from_be_bytes(len_slice.try_into().unwrap()) as usize;
+        let len_slice = self.peek(std::mem::size_of::<LengthTag>())?;
+        let len = LengthTag::from_le_bytes(len_slice.try_into().unwrap()) as usize;
 
         // read message
         // again, reading length twice because of the rustc bug
-        self.read(len + 8)
-            .map(|x| check_archived_root::<SequencerMessage>(&x[8..]).expect("invalid message"))
+        self.read(len + std::mem::size_of::<LengthTag>()).map(|x| {
+            check_archived_root::<SequencerMessage>(&x[std::mem::size_of::<LengthTag>()..])
+                .expect("invalid message")
+        })
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use byteorder::{NetworkEndian, WriteBytesExt};
+    use byteorder::{LittleEndian, WriteBytesExt};
     use rand::random;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -184,9 +186,9 @@ mod test {
 
             assert!(reader.read_message().is_err());
 
-            // write length as bigendian
+            // write length as little endian
             write_end
-                .write_u64::<NetworkEndian>(bytes.len() as u64)
+                .write_uint::<LittleEndian>(bytes.len() as u64, std::mem::size_of::<LengthTag>())
                 .unwrap();
             write_end.sync_all().unwrap();
 
@@ -233,9 +235,9 @@ mod test {
 
             assert!(reader.read_message().is_err());
 
-            // write length as bigendian
+            // write length as little endian
             write_end
-                .write_u64::<NetworkEndian>(bytes.len() as u64)
+                .write_uint::<LittleEndian>(bytes.len() as u64, std::mem::size_of::<LengthTag>())
                 .unwrap();
             write_end.sync_all().unwrap();
 
@@ -286,9 +288,9 @@ mod test {
             // archive message
             let bytes = rkyv::to_bytes::<_, 256>(message).unwrap();
 
-            // write length as bigendian
+            // write length as little endian
             write_end
-                .write_u64::<NetworkEndian>(bytes.len() as u64)
+                .write_uint::<LittleEndian>(bytes.len() as u64, std::mem::size_of::<LengthTag>())
                 .unwrap();
 
             // write archive

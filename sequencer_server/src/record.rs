@@ -2,16 +2,17 @@
 //! message bus. The sequencer's message history is split into two memory-mapped
 //! ring buffer files, one of which contains the current
 
-use memmap2::{MmapMut, MmapOptions, Mmap};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 
 //use rkyv::validation::CheckArchiveError;
-use sequencer_common::{LengthTag, AppId, SequencerMessage};
-use tokio::io::{AsyncWrite, AsyncWriteExt}; 
+use sequencer_common::{AppId, LengthTag, SequencerMessage};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use std::{
+    fmt::Display,
     fs::{File, OpenOptions},
     io::{Seek, SeekFrom, Write},
-    path::Path, fmt::Display,
+    path::Path,
 };
 
 /// How many bytes should we add to the file when it's time to grow the file?
@@ -178,7 +179,8 @@ impl MessageRecordBackend for MemMapBackend {
         //    .copy_from_slice(message.as_ref());
 
         // Push our length prefix.
-        self.mmap[self.mmap_cursor..self.mmap_cursor + std::mem::size_of::<LengthTag>()].copy_from_slice(&len_bytes);
+        self.mmap[self.mmap_cursor..self.mmap_cursor + std::mem::size_of::<LengthTag>()]
+            .copy_from_slice(&len_bytes);
         // Push our message.
         self.mmap[self.mmap_cursor + std::mem::size_of::<LengthTag>()..self.mmap_cursor + full_len]
             .copy_from_slice(message.as_ref());
@@ -187,9 +189,12 @@ impl MessageRecordBackend for MemMapBackend {
 
         // Zeroize the next length tag, and don't advance the cursor or current offset
         // (so it can get overwritten)
-        if (self.current_offset + full_len as u64 + std::mem::size_of::<LengthTag>() as u64) > self.current_file_len {
+        if (self.current_offset + full_len as u64 + std::mem::size_of::<LengthTag>() as u64)
+            > self.current_file_len
+        {
             let zeroes = [0u8; std::mem::size_of::<LengthTag>()];
-            self.mmap[self.mmap_cursor + full_len..self.mmap_cursor + full_len + std::mem::size_of::<LengthTag>()]
+            self.mmap[self.mmap_cursor + full_len
+                ..self.mmap_cursor + full_len + std::mem::size_of::<LengthTag>()]
                 .copy_from_slice(&zeroes);
             written_len += std::mem::size_of::<LengthTag>();
         }
@@ -212,7 +217,7 @@ impl MessageRecordBackend for MemMapBackend {
 
 #[derive(Debug, Clone)]
 pub enum RecordReadError {
-    InvalidLength(usize, usize, usize)
+    InvalidLength(usize, usize, usize),
 }
 
 impl Display for RecordReadError {
@@ -221,8 +226,8 @@ impl Display for RecordReadError {
             RecordReadError::InvalidLength(message_length, current_cursor, file_end) => write!(
                 f,
                 "Attempted to read a message of length {}, starting from position {}, which would take us past the end of the file which is at position {}",
-                message_length, 
-                current_cursor, 
+                message_length,
+                current_cursor,
                 file_end,
             ),
         }
@@ -237,44 +242,46 @@ pub struct RecordReader<'a> {
 }
 
 impl<'a> RecordReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self { 
-        Self {
-            cursor: 0, 
-            data 
-        }
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { cursor: 0, data }
     }
-    pub fn get_cursor(&self) -> usize { 
+    pub fn get_cursor(&self) -> usize {
         self.cursor
     }
-    /// Returns Ok(None) if we've reached the end of our record. 
-    pub fn get_next(&mut self) ->  Result<Option<&'a [u8]>, RecordReadError> { 
+    /// Returns Ok(None) if we've reached the end of our record.
+    pub fn get_next(&mut self) -> Result<Option<&'a [u8]>, RecordReadError> {
         let mut length_tag_bytes = [0u8; std::mem::size_of::<LengthTag>()];
-        length_tag_bytes.copy_from_slice(&self.data[self.cursor..self.cursor + std::mem::size_of::<LengthTag>()]);
+        length_tag_bytes.copy_from_slice(
+            &self.data[self.cursor..self.cursor + std::mem::size_of::<LengthTag>()],
+        );
         let message_length = LengthTag::from_le_bytes(length_tag_bytes) as usize;
         //length tag specifying zero is EOF
         if message_length == 0 {
             return Ok(None);
         }
-        if self.cursor + std::mem::size_of::<LengthTag>() + message_length > self.data.len() { 
-            return Err(RecordReadError::InvalidLength( message_length + std::mem::size_of::<LengthTag>(), self.cursor, self.data.len()));
+        if self.cursor + std::mem::size_of::<LengthTag>() + message_length > self.data.len() {
+            return Err(RecordReadError::InvalidLength(
+                message_length + std::mem::size_of::<LengthTag>(),
+                self.cursor,
+                self.data.len(),
+            ));
         }
 
         self.cursor += std::mem::size_of::<LengthTag>();
-        let message = &self.data[self.cursor..self.cursor+message_length];
+        let message = &self.data[self.cursor..self.cursor + message_length];
         self.cursor += message_length;
 
         Ok(Some(message))
     }
-
 }
 
-impl<'a> Iterator for RecordReader<'a> { 
+impl<'a> Iterator for RecordReader<'a> {
     type Item = Result<&'a [u8], RecordReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.get_next() { 
+        match self.get_next() {
             Ok(Some(msg)) => Some(Ok(msg)),
-            Ok(None) => None, 
+            Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
     }
@@ -282,7 +289,7 @@ impl<'a> Iterator for RecordReader<'a> {
 
 #[derive(Debug)]
 pub enum MmapReadError {
-    /// Record read issue, probably related to length tag. 
+    /// Record read issue, probably related to length tag.
     RecordReadLogic(RecordReadError),
     IoError(std::io::Error),
     CheckArchive(String),
@@ -291,18 +298,14 @@ pub enum MmapReadError {
 impl Display for MmapReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MmapReadError::RecordReadLogic(e) => write!(
-                f,
-                "{:?}",
-                e,
-            ),
+            MmapReadError::RecordReadLogic(e) => write!(f, "{:?}", e,),
             MmapReadError::IoError(e) => write!(
-                f, 
+                f,
                 "Could not read a memory-mapped message record due to io error: {:?}",
                 e
             ),
             MmapReadError::CheckArchive(e) => write!(
-                f, 
+                f,
                 "Failed to validate message structure when parsing to check app ID: {}",
                 e
             ),
@@ -324,22 +327,22 @@ impl From<std::io::Error> for MmapReadError {
 
 pub struct MemMapRecordReader {
     pub(in crate::record) mmap: Mmap,
-    /// How far, in absolute terms, have we got in this epoch's global byte stream? 
+    /// How far, in absolute terms, have we got in this epoch's global byte
+    /// stream?
     pub(in crate::record) start_offset: u64,
     /// How far has this reader gotten into the mmap?
-    /// NOTE - mmap 0 starts at start_offset. This does not correspond to a global stream index. 
+    /// NOTE - mmap 0 starts at start_offset. This does not correspond to a
+    /// global stream index.
     pub(in crate::record) last_read_offset: u64,
 }
 
-// No remap option because the behavior of MemMapRecordReader.new (file, old.most_recent_offset_visited()) 
-// would be identical to what remap would do anyway.
+// No remap option because the behavior of MemMapRecordReader.new (file,
+// old.most_recent_offset_visited()) would be identical to what remap would do
+// anyway.
 
 impl MemMapRecordReader {
-    pub fn new<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> { 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(file_path)?;
+    pub fn new<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error> {
+        let mut file = OpenOptions::new().read(true).write(false).open(file_path)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
 
@@ -365,34 +368,37 @@ impl MemMapRecordReader {
         })
     }
 
-    /// Attempt to read messages from between the last index we left off on, and self.mmap.len(),
-    /// checking to see if app_id matches one of the IDs on the provided array and only pushing if it does.
-    /// 
-    /// Providing an empty set of app IDs causes this object to send regardless / ignore the message's app ID. 
-    /// 
-    /// This method should be fully zero-copy, end-to-end, unless the OS performs its own copy when we 
-    /// push to the socket.
-    pub async fn read_and_push_to<W: AsyncWrite + AsyncWriteExt + Unpin>(&mut self, app_ids: &[AppId], writer: &mut W) -> Result<u64, MmapReadError> { 
-        let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize ..]);
+    /// Attempt to read messages from between the last index we left off on, and
+    /// self.mmap.len(), checking to see if app_id matches one of the IDs on
+    /// the provided array and only pushing if it does.
+    ///
+    /// Providing an empty set of app IDs causes this object to send regardless
+    /// / ignore the message's app ID.
+    ///
+    /// This method should be fully zero-copy, end-to-end, unless the OS
+    /// performs its own copy when we push to the socket.
+    pub async fn read_and_push_to<W: AsyncWrite + AsyncWriteExt + Unpin>(
+        &mut self,
+        app_ids: &[AppId],
+        writer: &mut W,
+    ) -> Result<u64, MmapReadError> {
+        let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize..]);
         while let Some(maybe_message) = reader.next() {
             let message = maybe_message?;
 
-            if app_ids.is_empty() { 
-                // No whitelist, match all. 
-                // Length tag 
+            if app_ids.is_empty() {
+                // No whitelist, match all.
+                // Length tag
                 writer.write_u16_le(message.len() as u16).await?;
                 // Write the message.
                 writer.write_all(message).await?;
-            }
-            else {
+            } else {
                 rkyv::check_archived_root::<SequencerMessage>(message)
                     .map_err(|e| MmapReadError::CheckArchive(format!("{:?}", e)))?;
 
-                let data = unsafe {
-                    rkyv::archived_root::<SequencerMessage>(message)
-                };
-                if app_ids.contains(&data.app_id) { 
-                    // Length tag 
+                let data = unsafe { rkyv::archived_root::<SequencerMessage>(message) };
+                if app_ids.contains(&data.app_id) {
+                    // Length tag
                     writer.write_u16_le(message.len() as u16).await?;
                     // Write the message.
                     writer.write_all(message).await?;
@@ -403,24 +409,27 @@ impl MemMapRecordReader {
         self.last_read_offset += reader.cursor as u64;
         Ok(amt_written)
     }
-    /// This mostly exists for tests - in production you will, generally, want to use read_and_push_to() as that is zero-copy. 
-    pub fn read_all(&mut self) -> Result<Vec<Vec<u8>>, MmapReadError>  {
+    /// This mostly exists for tests - in production you will, generally, want
+    /// to use read_and_push_to() as that is zero-copy.
+    pub fn read_all(&mut self) -> Result<Vec<Vec<u8>>, MmapReadError> {
         let mut all_messages = Vec::new();
-        let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize ..]);
+        let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize..]);
         while let Some(maybe_message) = reader.next() {
-            let message = maybe_message?; 
+            let message = maybe_message?;
             all_messages.push(message.to_vec());
         }
         self.last_read_offset += reader.cursor as u64;
         Ok(all_messages)
     }
-    /// How far in terms of global stream offset (total bytes sent this epoch) have we gotten? 
-    pub fn most_recent_offset_visited(&self) -> u64 { 
+    /// How far in terms of global stream offset (total bytes sent this epoch)
+    /// have we gotten?
+    pub fn most_recent_offset_visited(&self) -> u64 {
         self.last_read_offset + self.start_offset
     }
-    /// Where in the global stream offset (total bytes sent this epoch) does our currently-mapped range end? 
-    pub fn range_end(&self) -> u64 { 
-        self.start_offset + self.mmap.as_ref().len() as u64 
+    /// Where in the global stream offset (total bytes sent this epoch) does our
+    /// currently-mapped range end?
+    pub fn range_end(&self) -> u64 {
+        self.start_offset + self.mmap.as_ref().len() as u64
     }
 }
 
