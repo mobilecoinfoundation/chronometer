@@ -13,7 +13,7 @@ pub type EpochId = u16;
 pub type InstanceId = u16;
 pub type ClusterId = u16;
 
-pub type LengthTag = u16;
+pub type LengthTag = u64;
 
 /// Messages going into the sequencer server and
 /// being sent out by the sequencer

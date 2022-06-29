@@ -1139,6 +1139,8 @@ mod test {
     }
     #[test] 
     fn end_to_end_no_appid() { 
+        use rkyv::Deserialize;
+
         let _guard = IO_TEST_PERMISSIONS.lock();
         CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
         const NUM_TESTS: usize = 32;
@@ -1183,7 +1185,7 @@ mod test {
                 if num_messages_received >= NUM_TESTS { 
                     break;
                 }
-                let read_resl = tcp_stream.read_u16_le().await;
+                let read_resl = tcp_stream.read_u64_le().await;
                 let length_tag = read_resl.unwrap();
                 if length_tag != 0 {
                     let mut message_buf = vec![0u8; length_tag as usize]; 
@@ -1222,6 +1224,12 @@ mod test {
         println!("Checking to see if what was sent by the message bus and received by the client service are byte-for-byte identical");
         for (i, message) in all_messages.iter().enumerate() {
             assert_eq!(message, running_tally.get(i).unwrap());
+        }
+
+        for message in all_messages.iter() {
+            let mut deserializer = rkyv::de::deserializers::SharedDeserializeMap::default(); 
+            let checked = rkyv::check_archived_root::<SequencerMessage>(message).unwrap();
+            let _deserialized: SequencerMessage = checked.deserialize(&mut deserializer).unwrap();
         }
         
         //Clean up
