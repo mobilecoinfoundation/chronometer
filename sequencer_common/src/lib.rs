@@ -15,6 +15,9 @@ pub type ClusterId = u16;
 
 pub type LengthTag = u64;
 
+const _: () =
+    assert!(core::mem::size_of::<LengthTag>() == core::mem::align_of::<ArchivedSequencerMessage>());
+
 /// Messages going into the sequencer server and
 /// being sent out by the sequencer
 /// server over the bus are the same structure,
