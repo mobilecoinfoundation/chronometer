@@ -7,7 +7,7 @@ use rkyv::{
     Archive,
 };
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage, EpochId};
-use tokio::{sync::broadcast::Receiver, io::{AsyncReadExt}};
+use tokio::sync::broadcast::Receiver;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -351,27 +351,7 @@ fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
     runtime_builder.build()
 }
 
-fn offset_watcher_thread(channel_capacity: usize, update_interval: Duration) -> Receiver<u64> { 
-    // Intended to notify all Client-Service processes, which will likely be 
-    let (sender, receiver) = tokio::sync::broadcast::channel(channel_capacity);
-    //Prevent spurious errors on shutdown.
-    let _receiver_keepalive = receiver.resubscribe();
-    std::thread::spawn(move || {
-        let _receiver_keepalive = _receiver_keepalive;
-        let mut previous_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
-        loop { 
-            std::thread::sleep(update_interval);
-            let new_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
-            if new_offset > previous_offset { 
-                sender.send(new_offset-previous_offset).unwrap();
-                previous_offset = new_offset;
-            }
-        }
-    });
-    receiver
-}
-
-async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String, tcp_port: u16, path: PathBuf, offset_change_receiver: Receiver<u64>) { 
+async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String, tcp_port: u16, path: PathBuf, _shutdown_receiver: Receiver<()>) { 
     let address = match IpAddr::from_str(&un_parsed_address) {
         Ok(addr) => SocketAddr::from((addr, tcp_port)),
         Err(_parse_err) => match tokio::net::lookup_host(&un_parsed_address).await { 
@@ -385,32 +365,40 @@ async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String
     };
 
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-    //Make sure the closure captures it before borrowing it off into another closure.
-    let offset_change_receiver = offset_change_receiver;
+
     let reader_path = path.clone();
+
     loop {
         let (mut socket, _peer_addr) = listener.accept().await.unwrap();
-        let mut local_change_receiver = offset_change_receiver.resubscribe();
         let reader_path = reader_path.clone();
+
+        #[cfg(test)]
+        let mut shutdown_receiver = _shutdown_receiver.resubscribe();
+
         tokio::spawn(async move {
-            let mut read_buf = [0u8; 4096];
-            let (mut reader, mut writer) = socket.split();
+            //let mut read_buf = [0u8; 4096];
+            let (_reader, mut writer) = socket.split();
             let mut _subscribed_app_ids: Vec<AppId> = Vec::default();
+            let mut prev_offset = initial_offset;
             let mut last_sent_offset = initial_offset;
-            loop { 
-                tokio::select! {
-                    _new_bytes = local_change_receiver.recv() => {
-                        let current_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
-                        // Time does not go backwards
-                        assert!(current_offset > last_sent_offset);
-                        let mut file_reader = MemMapRecordReader::new(&reader_path, last_sent_offset).unwrap();
-                        file_reader.read_and_push_to(&_subscribed_app_ids, &mut writer).await.unwrap();
-                        last_sent_offset = file_reader.most_recent_offset_visited();
-                    }
-                    _len_read = reader.read(&mut read_buf) => { 
-                        //Todo: Read inbound messages
+            loop {
+                #[cfg(test)] {
+                    if let Ok(()) = shutdown_receiver.try_recv() { 
+                        break; 
                     }
                 }
+
+                let current_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
+
+                // Spinlock on offset changes. 
+                if prev_offset < current_offset {
+                    let mut file_reader = MemMapRecordReader::new(&reader_path, last_sent_offset).unwrap();
+                    file_reader.read_and_push_to(&mut writer).await.unwrap();
+                    last_sent_offset = file_reader.most_recent_offset_visited();
+                    prev_offset = current_offset; 
+                }
+                // Since we are spinlocking (not a typical async behavior), ensure we do not starve the scheduler. 
+                tokio::task::yield_now().await;
             }
         });
     }
@@ -446,14 +434,16 @@ fn main() -> std::io::Result<()> {
     let initial_offset = record.initial_offset();
     CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
 
-    let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
+    //let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
 
     let tcp_addr = args.address.clone();
     let tcp_port = args.port; 
 
     let reader_path = path.clone();
 
-    runtime.spawn(run_client_service_tasks(initial_offset, tcp_addr, tcp_port, reader_path, offset_change_receiver));
+    let (__unused, shutdown_receiver) = tokio::sync::broadcast::channel(3);
+
+    runtime.spawn(run_client_service_tasks(initial_offset, tcp_addr, tcp_port, reader_path, shutdown_receiver));
 
     // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
     std::thread::sleep(Duration::from_millis(5));
@@ -481,7 +471,7 @@ mod test {
     use super::*;
     use lazy_static::lazy_static;
     use sequencer_common::LengthTag;
-    use tokio::{sync::broadcast::{Receiver, Sender}, net::TcpStream};
+    use tokio::{sync::broadcast::{Receiver, Sender}, net::TcpStream, io::AsyncReadExt};
 
     // Any localhost-related network tests will interfere with eachother if you use
     // the cargo test command, which is multithreaded by default.
@@ -969,6 +959,34 @@ mod test {
     }
     impl std::error::Error for TestError {}
 
+
+    fn offset_watcher_thread(channel_capacity: usize, update_interval: Duration) -> Receiver<u64> { 
+        // Intended to notify all Client-Service processes, which will likely be 
+        let (sender, receiver) = tokio::sync::broadcast::channel(channel_capacity);
+        //Prevent spurious errors on shutdown.
+        let _receiver_keepalive = receiver.resubscribe();
+        std::thread::spawn(move || {
+            let _receiver_keepalive = _receiver_keepalive;
+            let mut previous_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
+            loop { 
+                std::thread::sleep(update_interval);
+                let new_offset: u64 = CURRENT_OFFSET.load(atomic::Ordering::Relaxed); 
+                if new_offset > previous_offset { 
+                    sender.send(new_offset-previous_offset).unwrap();
+                    previous_offset = new_offset;
+                }
+
+                #[cfg(test)] 
+                {
+                    if (new_offset != previous_offset) && (new_offset == 0) { 
+                        previous_offset = 0;
+                    }
+                }
+            }
+        });
+        receiver
+    }
+
     #[test]
     pub fn test_offset_counter_consistency() {
         let _guard = IO_TEST_PERMISSIONS.lock();
@@ -1137,8 +1155,9 @@ mod test {
 
         assert_eq!(record.inner.len() as u64, offset);
     }
+
     #[test] 
-    fn end_to_end_no_appid() { 
+    fn end_to_end_client_service() { 
         use rkyv::Deserialize;
 
         let _guard = IO_TEST_PERMISSIONS.lock();
@@ -1161,17 +1180,16 @@ mod test {
         let record = record::MemMapBackend::init(&path, 0).unwrap();
         // Determine current offset. 
         let initial_offset = record.initial_offset();
-        CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed); 
-
-        let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
-        
+        CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed);  
 
         let tcp_server_addr = IpAddr::from(Ipv6Addr::LOCALHOST);
         let tcp_server_port = 9999; 
 
         let reader_path = path.clone();
 
-        runtime.spawn(run_client_service_tasks(initial_offset, format!("{}", tcp_server_addr), tcp_server_port, reader_path.to_path_buf(), offset_change_receiver));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::broadcast::channel(24);
+
+        let client_service_join_handle = runtime.spawn(run_client_service_tasks(initial_offset, format!("{}", tcp_server_addr), tcp_server_port, reader_path.to_path_buf(), shutdown_receiver));
         
         // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
         std::thread::sleep(Duration::from_millis(5));
@@ -1232,6 +1250,10 @@ mod test {
             let _deserialized: SequencerMessage = checked.deserialize(&mut deserializer).unwrap();
         }
         
+        println!("Cleaning up after the test.");
+        shutdown_sender.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        client_service_join_handle.abort();
         //Clean up
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();

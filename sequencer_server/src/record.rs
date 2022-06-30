@@ -5,7 +5,7 @@
 use memmap2::{MmapMut, MmapOptions, Mmap};
 
 //use rkyv::validation::CheckArchiveError;
-use sequencer_common::{LengthTag, AppId, SequencerMessage};
+use sequencer_common::LengthTag;
 use tokio::io::{AsyncWrite, AsyncWriteExt}; 
 
 use std::{
@@ -372,32 +372,16 @@ impl MemMapRecordReader {
     /// 
     /// This method should be fully zero-copy, end-to-end, unless the OS performs its own copy when we 
     /// push to the socket.
-    pub async fn read_and_push_to<W: AsyncWrite + AsyncWriteExt + Unpin>(&mut self, app_ids: &[AppId], writer: &mut W) -> Result<u64, MmapReadError> { 
+    pub async fn read_and_push_to<W: AsyncWrite + AsyncWriteExt + Unpin>(&mut self, writer: &mut W) -> Result<u64, MmapReadError> { 
         let mut reader = RecordReader::new(&self.mmap.as_ref()[self.last_read_offset as usize ..]);
         while let Some(maybe_message) = reader.next() {
             let message = maybe_message?;
 
-            if app_ids.is_empty() { 
-                // No whitelist, match all. 
-                // Length tag 
-                writer.write_u64_le(message.len() as LengthTag).await?;
-                // Write the message.
-                writer.write_all(message).await?;
-            }
-            else {
-                rkyv::check_archived_root::<SequencerMessage>(message)
-                    .map_err(|e| MmapReadError::CheckArchive(format!("{:?}", e)))?;
-
-                let data = unsafe {
-                    rkyv::archived_root::<SequencerMessage>(message)
-                };
-                if app_ids.contains(&data.app_id) { 
-                    // Length tag 
-                    writer.write_u64_le(message.len() as LengthTag).await?;
-                    // Write the message.
-                    writer.write_all(message).await?;
-                }
-            }
+            // No whitelist, match all. 
+            // Length tag 
+            writer.write_u64_le(message.len() as LengthTag).await?;
+            // Write the message.
+            writer.write_all(message).await?;
         }
         let amt_written = reader.cursor as u64 - self.last_read_offset;
         self.last_read_offset += reader.cursor as u64;
