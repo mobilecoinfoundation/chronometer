@@ -7,7 +7,6 @@ use rkyv::{
     Archive,
 };
 use sequencer_common::{AppId, ArchivedSequencerMessage, SequencerMessage, EpochId};
-use tokio::sync::broadcast::Receiver;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -351,7 +350,7 @@ fn build_async_runtime() -> io::Result<tokio::runtime::Runtime> {
     runtime_builder.build()
 }
 
-async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String, tcp_port: u16, path: PathBuf, _shutdown_receiver: Receiver<()>) { 
+async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String, tcp_port: u16, path: PathBuf) { 
     let address = match IpAddr::from_str(&un_parsed_address) {
         Ok(addr) => SocketAddr::from((addr, tcp_port)),
         Err(_parse_err) => match tokio::net::lookup_host(&un_parsed_address).await { 
@@ -372,9 +371,6 @@ async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String
         let (mut socket, _peer_addr) = listener.accept().await.unwrap();
         let reader_path = reader_path.clone();
 
-        #[cfg(test)]
-        let mut shutdown_receiver = _shutdown_receiver.resubscribe();
-
         tokio::spawn(async move {
             //let mut read_buf = [0u8; 4096];
             let (_reader, mut writer) = socket.split();
@@ -382,11 +378,6 @@ async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String
             let mut prev_offset = initial_offset;
             let mut last_sent_offset = initial_offset;
             loop {
-                #[cfg(test)] {
-                    if let Ok(()) = shutdown_receiver.try_recv() { 
-                        break; 
-                    }
-                }
 
                 let current_offset = CURRENT_OFFSET.load(atomic::Ordering::Relaxed);
 
@@ -441,9 +432,7 @@ fn main() -> std::io::Result<()> {
 
     let reader_path = path.clone();
 
-    let (__unused, shutdown_receiver) = tokio::sync::broadcast::channel(3);
-
-    runtime.spawn(run_client_service_tasks(initial_offset, tcp_addr, tcp_port, reader_path, shutdown_receiver));
+    runtime.spawn(run_client_service_tasks(initial_offset, tcp_addr, tcp_port, reader_path));
 
     // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
     std::thread::sleep(Duration::from_millis(5));
@@ -1187,9 +1176,7 @@ mod test {
 
         let reader_path = path.clone();
 
-        let (shutdown_sender, shutdown_receiver) = tokio::sync::broadcast::channel(24);
-
-        let client_service_join_handle = runtime.spawn(run_client_service_tasks(initial_offset, format!("{}", tcp_server_addr), tcp_server_port, reader_path.to_path_buf(), shutdown_receiver));
+        let client_service_join_handle = runtime.spawn(run_client_service_tasks(initial_offset, format!("{}", tcp_server_addr), tcp_server_port, reader_path.to_path_buf()));
         
         // Attempt to give the client service tasks thread a moment to spin up before there's any possibility of incrementing the global offset.
         std::thread::sleep(Duration::from_millis(5));
@@ -1251,10 +1238,10 @@ mod test {
         }
         
         println!("Cleaning up after the test.");
-        shutdown_sender.send(()).unwrap();
+        //Clean up
         std::thread::sleep(Duration::from_millis(10));
         client_service_join_handle.abort();
-        //Clean up
+        drop(runtime);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(Path::new("test_output/")).unwrap();
         CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
