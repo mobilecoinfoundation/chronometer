@@ -1,0 +1,2 @@
+[workspace]
+members = ["sequencer_common", "sequencer_server", "unsequenced_producer", "iodaemon"]

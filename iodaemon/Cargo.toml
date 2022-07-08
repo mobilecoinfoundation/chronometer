@@ -1,0 +1,20 @@
+[package]
+name = "iodaemon"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+sequencer_common = { path = "../sequencer_common" }
+
+byteorder = { version = "1.3" }
+rkyv = { version = "0.7", features = ["validation", "size_32", "alloc"] }
+
+clap = { version = "3.1", features = ["derive", "env"] }
+nix = {version = "0.24", features = ["zerocopy", "fs", "mman"] }
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "*"
+rand = "*"
