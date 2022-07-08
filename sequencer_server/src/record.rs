@@ -4,19 +4,18 @@
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
-//use rkyv::validation::CheckArchiveError;
 use sequencer_common::LengthTag;
 use tokio::io::{AsyncWrite, AsyncWriteExt}; 
 
 use std::{
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom},
     path::Path,
 };
 
 /// How many bytes should we add to the file when it's time to grow the file?
-const GROW_BY: usize = 65535;
+const GROW_BY: usize = 65536;
 
 pub trait MessageRecordBackend: Sized {
     fn init<T: AsRef<Path>>(file_path: T, start_offset: u64) -> Result<Self, std::io::Error>;
@@ -57,24 +56,22 @@ impl MemMapBackend {
             self.file.set_len(new_len)?;
             self.file.seek(SeekFrom::Start(self.current_file_len))?;
 
-            // Zeroize the next length tag (null terminate) and don't advance the cursor or
-            // current offset (so it can get overwritten)
-            let zeroes = [0u8; std::mem::size_of::<LengthTag>()];
-            self.file.write_all(&zeroes)?;
-            self.file.seek(SeekFrom::Start(self.current_file_len))?;
-
             self.current_file_len = new_len;
+
             self.mmap = {
                 let mut options = MmapOptions::default();
-                // Append - start at the end of the file.
+                // Append - start at the old end of the file.
                 options.offset(self.current_offset);
-                options.len(new_len as usize - self.current_offset as usize);
+
+                let mmap_len = new_len as usize - self.current_offset as usize;
+                // Per memmap2's source, if len is not specified it will be file_len - self.offset, which is exactly what we want anyway.
+                // options.len(mmap_len); //<-- This causes OOMs.
 
                 #[cfg(debug_assertions)]
                 {
                     println!(
-                        "Memory map will start at {} and be {} bytes long",
-                        self.current_offset, to_grow
+                        "Memory map will start at {} and should be {} bytes long. The file will be {} bytes long",
+                        self.current_offset, mmap_len, new_len
                     );
                 }
 
@@ -83,6 +80,13 @@ impl MemMapBackend {
                 // other processes can change them out from under you.
                 unsafe { options.map_mut(&self.file)? }
             };
+            #[cfg(debug_assertions)]
+            {
+                println!(
+                    "Memory map expanded to {} bytes long",
+                    self.mmap.len()
+                );
+            }
             self.mmap_cursor = 0;
         }
         Ok(())
@@ -118,6 +122,7 @@ impl MessageRecordBackend for MemMapBackend {
         };
 
         let mut options = MmapOptions::default();
+
         // Append - start at the end of the file.
         options.offset(start_offset);
 
@@ -125,14 +130,6 @@ impl MessageRecordBackend for MemMapBackend {
         // since, at an OS level, not much safety is built in -
         // other processes can change them out from under you.
         let mmap = unsafe { options.map_mut(&file)? };
-
-        /*
-        #[cfg(unix)]
-        {
-            // This is a Unix-only feature so there is no
-            // perf hint on, for example, Azure.
-            mmap.advise(memmap2::Advice::Sequential)?;
-        }*/
 
         Ok(Self {
             file,
@@ -148,64 +145,55 @@ impl MessageRecordBackend for MemMapBackend {
     fn write_message<T: AsRef<[u8]>>(&mut self, message: T) -> Result<u64, std::io::Error> {
         // Length of message payload to append.
         let message_len = message.as_ref().len() as usize;
-        assert!(message_len < LengthTag::MAX as usize);
-        // Total new bytes to append.
-        let additional_len = (std::mem::size_of::<LengthTag>() + message_len) as usize;
-        // End of length prefix, start of message payload.
-        //let message_start = self.current_offset + LENGTH_PREFIX_LEN as u64;
+        if message_len > (LengthTag::MAX as usize) {
+            return Err(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput, 
+                    format!("Sequencer message payloads in excess of {} bytes cannot be stored by this system. \
+                    The message provided is {} bytes long.", LengthTag::MAX, message_len)
+                )
+            );
+        }
+
         // Length prefix bytes.
-        // TODO: Discuss with team - are we sure we want little-endian?
         let len_bytes = (message.as_ref().len() as LengthTag).to_le_bytes();
-        let full_len = std::mem::size_of::<LengthTag>() + message_len as usize;
-        // How long will the file need to be to contain this new information?
-        let new_record_end = self.current_offset + additional_len as u64;
+        // Total message length, including length prefix. 
+        let full_message_len = std::mem::size_of::<LengthTag>() + message_len as usize;
+
+        // Total new bytes to append, including null terminator (which does not advance cursor)
+        let to_write_len = full_message_len + std::mem::size_of::<LengthTag>() as usize;
+
+        // How long will the underlying record need to be to contain this new information?
+        let new_record_end = self.current_offset + full_message_len as u64;
 
         // Grow the file and associated memmap
-        self.grow_if_needed(additional_len as u64)?;
-
-        /*#[cfg(unix)]
-        {
-            // This is a Unix-only feature so there is no
-            // perf hint on, for example, Azure.
-            if let Err(e) = mmap.advise(memmap2::Advice::Sequential) {
-                return future::err(e);
-            }
-        }*/
+        self.grow_if_needed(to_write_len as u64)?;
 
         // Current range of the memory map right now appears to be offset..len - this
-        // affects how the slice works. mmap[self.current_offset as usize ..
-        // message_start as usize]    .copy_from_slice(&len_bytes);
-        //mmap[message_start as usize .. new_file_end as usize]
-        //    .copy_from_slice(message.as_ref());
+        // affects how the slice works.
+        // i.e. the memory map's "offset" becomes 0 in the index space of the memory map as a slice.
 
         // Push our length prefix.
         self.mmap[self.mmap_cursor..self.mmap_cursor + std::mem::size_of::<LengthTag>()]
             .copy_from_slice(&len_bytes);
         // Push our message.
-        self.mmap[self.mmap_cursor + std::mem::size_of::<LengthTag>()..self.mmap_cursor + full_len]
+        self.mmap[self.mmap_cursor + std::mem::size_of::<LengthTag>()..self.mmap_cursor + full_message_len]
             .copy_from_slice(message.as_ref());
 
-        let mut written_len = full_len;
+        // Update this so grow_if_needed knows what to do.
+        self.current_offset = new_record_end;
+        // Update our current offset counter.
+        self.mmap_cursor += full_message_len;
 
         // Zeroize the next length tag, and don't advance the cursor or current offset
         // (so it can get overwritten)
-        if (self.current_offset + full_len as u64 + std::mem::size_of::<LengthTag>() as u64)
-            > self.current_file_len
-        {
-            let zeroes = [0u8; std::mem::size_of::<LengthTag>()];
-            self.mmap[self.mmap_cursor + full_len
-                ..self.mmap_cursor + full_len + std::mem::size_of::<LengthTag>()]
-                .copy_from_slice(&zeroes);
-            written_len += std::mem::size_of::<LengthTag>();
-        }
+        const ZERO_TAG : [u8; std::mem::size_of::<LengthTag>()] = [0u8; std::mem::size_of::<LengthTag>()];
+        self.mmap[self.mmap_cursor..self.mmap_cursor + std::mem::size_of::<LengthTag>()]
+            .copy_from_slice(&ZERO_TAG);
 
-        self.mmap.flush_range(self.mmap_cursor, written_len)?;
+        self.mmap.flush_range(self.mmap_cursor, to_write_len)?;
 
-        // Update our current offset counter.
-        self.current_offset = new_record_end;
-        self.mmap_cursor += written_len;
-
-        Ok(written_len as u64)
+        Ok(to_write_len as u64)
     }
     fn initial_offset(&self) -> u64 {
         self.start_offset
@@ -358,6 +346,7 @@ impl MemMapRecordReader {
 
         let mut options = MmapOptions::default();
         options.offset(start_offset);
+        options.len(file_len as usize - start_offset as usize);
 
         let mmap = unsafe { options.map(&file)? };
 

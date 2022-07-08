@@ -377,7 +377,6 @@ async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String
         tokio::spawn(async move {
             //let mut read_buf = [0u8; 4096];
             let (_reader, mut writer) = socket.split();
-            let mut _subscribed_app_ids: Vec<AppId> = Vec::default();
             let mut prev_offset = initial_offset;
             let mut last_sent_offset = initial_offset;
             loop {
@@ -406,28 +405,35 @@ fn main() -> std::io::Result<()> {
     }
 
     //Make sure the path exists.
-    let mut path: PathBuf = args.record_path;
+    let mut record_path: PathBuf = args.record_path;
     //No record file?
-    if path.as_os_str().is_empty() {
+    if record_path.as_os_str().is_empty() {
         // TODO: Figure out better defaults for record file path.
-        path = PathBuf::from("messagebus");
+        record_path = PathBuf::from("messagebus");
     }
     //Make sure our directory exists.
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = record_path.parent() {
         if parent.is_dir() {
             std::fs::create_dir_all(parent)?;
         }
     }
 
+    if record_path.exists() && (args.offset == 0) { 
+        let mut error_text = format!("A message bus file already exists at the path {}, and no offset was specified. \n\
+        This means any attempt to write to the bus would overwrite this entire file, starting from the beginning. \n\
+        Please delete this file or provide a valid offset.", record_path.to_string_lossy());
+        eprintln!("{}", &error_text);
+        error_text = error_text.replace("\n", "");
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, error_text));
+    }
+
     let runtime = build_async_runtime().unwrap();
 
     // Load our record file.
-    let record = record::MemMapBackend::init(&path, args.offset)?;
+    let record = record::MemMapBackend::init(&record_path, args.offset)?;
     // Determine current offset.
     let initial_offset = record.initial_offset();
     CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed);
-
-    //let offset_change_receiver = offset_watcher_thread(4096, Duration::from_millis(50));
 
     let tcp_addr = args.address.clone();
     let tcp_port = args.port;
@@ -436,7 +442,7 @@ fn main() -> std::io::Result<()> {
         initial_offset,
         tcp_addr,
         tcp_port,
-        path,
+        record_path,
     ));
 
     // Attempt to give the client service tasks thread a moment to spin up before
