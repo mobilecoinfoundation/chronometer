@@ -73,4 +73,16 @@ impl ArchivedSequencerMessage {
             Pin::new_unchecked(reference)
         }
     }
+
+    #[inline(always)]
+    // This is the pin projection from SequencerMessage -> app_sequence_number
+    pub fn modify_app_sequence_number(self: Pin<&mut Self>, value: u64) -> Pin<&mut Self> {
+        // Sequence number is not a reference type and does not contain any reference
+        // types, so this unsafe block *should* be good here.
+        unsafe {
+            let reference = self.get_unchecked_mut();
+            reference.app_sequence_number = value;
+            Pin::new_unchecked(reference)
+        }
+    }
 }
