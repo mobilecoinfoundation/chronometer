@@ -17,7 +17,7 @@ struct Args {
     ip_address: IpAddr,
     #[clap(short, long, env)]
     port: u16,
-    #[clap(short, long, env, value_parser = clap::value_parser!(u16).range(1..1500))]
+    #[clap(short, long, env, value_parser = clap::value_parser!(u16).range(1..=1500))]
     size: u16,
     #[clap(long, env, default_value_t = 0)]
     interval: u64,
@@ -50,13 +50,3 @@ pub fn main() -> std::io::Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}

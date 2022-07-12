@@ -107,6 +107,7 @@ name = "chrono_examples"
 version = "0.1.0"
 dependencies = [
  "clap 3.2.7",
+ "iodaemon",
  "rand",
  "rkyv",
  "sequencer_common",
