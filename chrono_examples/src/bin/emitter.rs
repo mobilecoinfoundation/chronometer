@@ -1,4 +1,6 @@
 use std::net::{IpAddr, UdpSocket, SocketAddr};
+use std::thread::sleep;
+use std::time::Duration;
 use std::pin::Pin;
 
 use clap::Parser;
@@ -15,6 +17,8 @@ struct Args {
     port: u16,
     #[clap(short, long, env, value_parser = clap::value_parser!(u16).range(1..1500))]
     size: u16,
+    #[clap(long, env, default_value_t = 0)]
+    interval: u64
 }
 
 pub fn main() -> std::io::Result<()> {
@@ -43,6 +47,8 @@ pub fn main() -> std::io::Result<()> {
         archived_message.modify_app_sequence_number(seqno + 1);
         
         socket.send(&message_bytes)?;
+
+        sleep(Duration::from_millis(args.interval)); // on Unix, doesn't even do a syscall with arg of 0
     }
 }
 
