@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::atomic::{self, AtomicU64},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::record::MemMapRecordReader;
@@ -149,8 +149,6 @@ struct InboundServer<Record: MessageRecordBackend> {
     /// order of events, always holds the sequence number of the previous
     /// message sent out over the bus.
     pub counter: u64,
-    /// Total bytes written this epoch. Used for "offset"
-    pub _total_written: u64,
     /// Last-received sequence numbers per-app.
     /// Used to deduplicate messages.
     ///
@@ -160,6 +158,9 @@ struct InboundServer<Record: MessageRecordBackend> {
     app_sequence_numbers: FxHashMap<AppId, u64>,
     /// Underlying storage to which we write our messages.
     pub record: Record,
+    /// When did this epoch start? Used for timestamping.
+    pub epoch_start: Instant,
+    pub epoch: EpochId,
 }
 
 impl<Record> InboundServer<Record>
@@ -169,15 +170,16 @@ where
     pub fn new(
         port: u16,
         record: Record,
-        starting_offset: u64,
+        epoch: EpochId,
         starting_seq: u64,
     ) -> InboundServer<Record> {
         InboundServer {
             port,
             counter: starting_seq,
-            _total_written: starting_offset,
+            epoch,
             app_sequence_numbers: HashMap::default(),
             record,
+            epoch_start: Instant::now(),
         }
     }
 
@@ -189,6 +191,9 @@ where
         self.counter += 1;
 
         message.modify_sequence_number(self.counter)
+            .modify_timestamp(self.epoch_start.elapsed().as_nanos())
+            .modify_offset(CURRENT_OFFSET.load(atomic::Ordering::Relaxed))
+            .modify_epoch(self.epoch)
     }
 
     #[inline]
@@ -449,7 +454,7 @@ fn main() -> std::io::Result<()> {
     // there's any possibility of incrementing the global offset.
     std::thread::sleep(Duration::from_millis(5));
 
-    let inbound_server = InboundServer::new(args.port, record, initial_offset, args.sequence);
+    let inbound_server = InboundServer::new(args.port, record, 0, initial_offset);
     inbound_server
         .start()
         .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
@@ -686,7 +691,8 @@ mod test {
     // This is used as the first half of a couple of other tests.
     fn test_record_emit<T: MessageRecordBackend>(
         num_tests: u64,
-        offset_start: u64,
+        epoch: EpochId,
+        _offset_start: u64,
         counter_start: u64,
         record: T,
     ) -> Result<T, Box<dyn std::error::Error>> {
@@ -696,7 +702,7 @@ mod test {
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
         let mut server =
-            InboundServer::new(server_addr.port(), record, offset_start, counter_start);
+            InboundServer::new(server_addr.port(), record, epoch, counter_start);
         //server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
@@ -765,6 +771,7 @@ mod test {
             NUM_TESTS as u64,
             0,
             0,
+            0,
             VecBackend {
                 inner: Vec::default(),
             },
@@ -809,7 +816,7 @@ mod test {
         }
 
         let record = MemMapBackend::init(&path, 0).unwrap();
-        let record = test_record_emit(NUM_TESTS as u64, 0, 0, record).unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, 0, 0, record).unwrap();
 
         // Make sure the file handle gets dropped so we can open it again without
         // clobbering anything.
@@ -862,7 +869,7 @@ mod test {
 
         {
             let record = MemMapBackend::init(&path, 0).unwrap();
-            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0_u64, 0, record).unwrap();
+            let record = test_record_emit(NUM_TESTS_INITIAL as u64, 0, 0_u64, 0, record).unwrap();
 
             last_offset = record.record_len();
             // Make sure the file handle gets dropped so we can open it again without
@@ -895,6 +902,7 @@ mod test {
             let record = MemMapBackend::init(&path, last_offset).unwrap();
             let record = test_record_emit(
                 NUM_TESTS_SECOND as u64,
+                1,
                 CURRENT_OFFSET.load(atomic::Ordering::Relaxed),
                 NUM_TESTS_INITIAL as u64,
                 record,
@@ -1235,7 +1243,7 @@ mod test {
 
         let record = MemMapBackend::init(&path, 0).unwrap();
         //Actually push our messages.
-        let record = test_record_emit(NUM_TESTS as u64, 0_u64, 0, record).unwrap();
+        let record = test_record_emit(NUM_TESTS as u64, 0, 0, 0, record).unwrap();
         //Test is done, check results.
         let len_wrote = record.record_len();
         println!(

@@ -14,6 +14,8 @@ pub type InstanceId = u16;
 pub type ClusterId = u16;
 
 pub type LengthTag = u64;
+/// Number of nanoseconds since start of this epoch. 
+pub type Timestamp = u128;
 
 const _: () =
     assert!(core::mem::size_of::<LengthTag>() == core::mem::align_of::<ArchivedSequencerMessage>());
@@ -28,10 +30,12 @@ const _: () =
 pub struct SequencerMessage {
     /// Number of bytes from the start of this epoch.
     pub offset: u64,
-    /// On the way into the bus, from senders: This is the per-app sequence
-    /// number used to deduplicate. On the bus, sent by the sequencer:
+    /// On the bus, sent by the sequencer:
     /// Global canonical sequence number for all bus participants
+    /// On the way into the bus, this is ignored. 
     pub sequence_number: u64,
+    /// Number of nanoseconds since start of this epoch. 
+    pub timestamp: Timestamp,
     pub epoch: EpochId,
     pub instance_id: InstanceId,
     pub app_id: AppId,            // Potentially replace with non-exhaustive enum
@@ -51,6 +55,7 @@ impl SequencerMessage {
         SequencerMessage {
             offset: 0,
             sequence_number: 0,
+            timestamp: 0,
             epoch: 0,
             app_id,
             instance_id,
@@ -82,6 +87,32 @@ impl ArchivedSequencerMessage {
         unsafe {
             let reference = self.get_unchecked_mut();
             reference.app_sequence_number = value;
+            Pin::new_unchecked(reference)
+        }
+    }
+
+    #[inline(always)]
+    pub fn modify_timestamp(self: Pin<&mut Self>, value: Timestamp) -> Pin<&mut Self> {
+        unsafe {
+            let reference = self.get_unchecked_mut();
+            reference.timestamp = value;
+            Pin::new_unchecked(reference)
+        }
+    }
+
+    #[inline(always)]
+    pub fn modify_offset(self: Pin<&mut Self>, value: u64) -> Pin<&mut Self> {
+        unsafe {
+            let reference = self.get_unchecked_mut();
+            reference.offset = value;
+            Pin::new_unchecked(reference)
+        }
+    }
+    #[inline(always)]
+    pub fn modify_epoch(self: Pin<&mut Self>, value: EpochId) -> Pin<&mut Self> {
+        unsafe {
+            let reference = self.get_unchecked_mut();
+            reference.epoch = value;
             Pin::new_unchecked(reference)
         }
     }
