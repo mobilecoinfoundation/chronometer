@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 sequencer_common = { path = "../sequencer_common" }
+iodaemon = { path = "../iodaemon" }
 
 rkyv = { version = "0.7", features = ["validation", "size_32", "alloc"] }
 
