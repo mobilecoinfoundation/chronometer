@@ -6,7 +6,7 @@ use rkyv::{
     validation::{validators::DefaultValidatorError, CheckArchiveError},
     AlignedVec, Archive,
 };
-use sequencer_common::{AppId, ArchivedSequencerMessage, EpochId, SequencerMessage};
+use sequencer_common::{AppId, ArchivedSequencerMessage, EpochId, SequencerMessage, Timestamp};
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -171,6 +171,7 @@ where
         port: u16,
         record: Record,
         epoch: EpochId,
+        epoch_start: Instant,
         starting_seq: u64,
     ) -> InboundServer<Record> {
         InboundServer {
@@ -179,19 +180,20 @@ where
             epoch,
             app_sequence_numbers: HashMap::default(),
             record,
-            epoch_start: Instant::now(),
+            epoch_start,
         }
     }
 
     #[inline(always)]
     pub fn update_counter<'a>(
         &mut self,
-        message: Pin<&'a mut ArchivedSequencerMessage>,
+        message: Pin<&'a mut ArchivedSequencerMessage>, 
+        timestamp_received: Timestamp
     ) -> Pin<&'a mut ArchivedSequencerMessage> {
         self.counter += 1;
 
         message.modify_sequence_number(self.counter)
-            .modify_timestamp(self.epoch_start.elapsed().as_nanos())
+            .modify_timestamp(timestamp_received)
             .modify_offset(CURRENT_OFFSET.load(atomic::Ordering::Relaxed))
             .modify_epoch(self.epoch)
     }
@@ -200,6 +202,7 @@ where
     pub fn process_inbound_message<'a>(
         &mut self,
         data: Pin<&'a mut <SequencerMessage as Archive>::Archived>,
+        timestamp_received: Timestamp,
     ) -> std::result::Result<Pin<&'a mut ArchivedSequencerMessage>, SequencerError> {
         let app_id = data.app_id;
         let app_sequence_number = data.app_sequence_number;
@@ -217,14 +220,14 @@ where
                 //New sequence number! Publish this message.
                 *previous_app_seq = app_sequence_number;
 
-                let data = self.update_counter(data);
+                let data = self.update_counter(data, timestamp_received);
                 Ok(data)
             }
         } else {
             // We have not seen this app ID yet, add it to the dict.
             self.app_sequence_numbers
                 .insert(app_id, app_sequence_number);
-            let data = self.update_counter(data);
+            let data = self.update_counter(data, timestamp_received);
             Ok(data)
         }
     }
@@ -248,10 +251,12 @@ where
         &mut self,
         socket: &UdpSocket,
         recv_buffer: &'a mut AlignedVec,
-    ) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64), SequencerError> {
+    ) -> Result<(Pin<&'a mut ArchivedSequencerMessage>, u64, Timestamp), SequencerError> {
         let (message_len, _addr) = socket
             .recv_from(recv_buffer)
             .map_err(SequencerError::UdpReceiveError)?;
+        
+            let timestamp_received = self.epoch_start.elapsed().as_nanos() as Timestamp;
 
         rkyv::check_archived_root::<SequencerMessage>(&recv_buffer[..message_len])
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))?;
@@ -263,7 +268,7 @@ where
         let data = unsafe {
             rkyv::archived_root_mut::<SequencerMessage>(Pin::new(&mut recv_buffer[..message_len]))
         };
-        Ok((data, message_len as u64))
+        Ok((data, message_len as u64, timestamp_received))
     }
 
     #[inline]
@@ -272,8 +277,8 @@ where
         socket: &UdpSocket,
         recv_buffer: &mut AlignedVec,
     ) -> std::result::Result<(), SequencerError> {
-        let (data, message_len) = self.poll_message(socket, recv_buffer)?;
-        let message_maybe = match self.process_inbound_message(data) {
+        let (data, message_len, timestamp_received) = self.poll_message(socket, recv_buffer)?;
+        let message_maybe = match self.process_inbound_message(data, timestamp_received) {
             Ok(msg) => Some(msg),
             Err(e) => match e.get_kind() {
                 SequencerErrorKind::DuplicateMessage => {
@@ -377,6 +382,7 @@ async fn run_client_service_tasks(initial_offset: u64, un_parsed_address: String
 
     loop {
         let (mut socket, _peer_addr) = listener.accept().await.unwrap();
+
         let reader_path = reader_path.clone();
 
         tokio::spawn(async move {
@@ -443,18 +449,20 @@ fn main() -> std::io::Result<()> {
     let tcp_addr = args.address.clone();
     let tcp_port = args.port;
 
+    let epoch_start = Instant::now();
+
     runtime.spawn(run_client_service_tasks(
         initial_offset,
         tcp_addr,
         tcp_port,
-        record_path,
+        record_path
     ));
 
     // Attempt to give the client service tasks thread a moment to spin up before
     // there's any possibility of incrementing the global offset.
     std::thread::sleep(Duration::from_millis(5));
 
-    let inbound_server = InboundServer::new(args.port, record, 0, initial_offset);
+    let inbound_server = InboundServer::new(args.port, record, 0, epoch_start, initial_offset);
     inbound_server
         .start()
         .map_err(|e| std::io::Error::new(IoErrorKind::InvalidData, Box::new(e)))
@@ -512,9 +520,11 @@ mod test {
 
         println!("data is: {:?}", data);
 
+        let epoch_start = Instant::now();
+
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, 0);
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, epoch_start.clone(), 0);
 
         let server_listener = UdpSocket::bind(server_addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -532,11 +542,11 @@ mod test {
 
         let mut recv_buffer = AlignedVec::new();
         recv_buffer.extend_from_slice(&[0u8; 2048]);
-        let (raw_message, _len): (Pin<&mut ArchivedSequencerMessage>, u64) = inbound_server
+        let (raw_message, _len, recv_timestamp): (Pin<&mut ArchivedSequencerMessage>, u64, Timestamp) = inbound_server
             .poll_message(&server_listener, &mut recv_buffer)
             .unwrap();
         let message: Pin<&mut ArchivedSequencerMessage> =
-            inbound_server.process_inbound_message(raw_message).unwrap();
+            inbound_server.process_inbound_message(raw_message, recv_timestamp).unwrap();
         // Extract a message back out
         // This always returns With<_, _>, no matter
         // how I try to finagle it. So, commenting this test out for now.
@@ -563,9 +573,11 @@ mod test {
         // This should implicitly drop when the test ends.
         let _guard = IO_TEST_PERMISSIONS.lock();
 
+        let epoch_start = Instant::now();
+
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
-        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, 0);
+        let mut inbound_server = InboundServer::new(server_addr.port(), DummyBackend {}, 0, epoch_start.clone(), 0);
 
         let server_listener = UdpSocket::bind(server_addr)
             .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -600,11 +612,11 @@ mod test {
         recv_buffer.extend_from_slice(&[0u8; 2048]);
         for _i in 0..(NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server
+            let (data, _len, recv_timestamp) = inbound_server
                 .poll_message(&server_listener, &mut recv_buffer)
                 .unwrap();
             //There should be no duplicates here.
-            let resl = inbound_server.process_inbound_message(data).unwrap();
+            let resl = inbound_server.process_inbound_message(data, recv_timestamp).unwrap();
             assert!(inbound_server.counter > prev_counter);
             assert_eq!(inbound_server.counter, resl.as_ref().sequence_number);
             //println!("Counter is now {}", inbound_server.counter);
@@ -639,11 +651,11 @@ mod test {
         }
         for _i in 0..(NUM_TEST_SENDERS * NUM_MESSAGE_TEST) as u64 {
             let prev_counter = inbound_server.counter;
-            let (data, _len) = inbound_server
+            let (data, _len, recv_timestamp) = inbound_server
                 .poll_message(&server_listener, &mut recv_buffer)
                 .unwrap();
             //Should always be a duplicate in this context.
-            let _resl = inbound_server.process_inbound_message(data).unwrap_err();
+            let _resl = inbound_server.process_inbound_message(data, recv_timestamp).unwrap_err();
             assert_eq!(inbound_server.counter, prev_counter);
             //println!("Counter is now {}", inbound_server.counter);
         }
@@ -674,10 +686,10 @@ mod test {
         res.expect("Failed to send");
 
         //println!("Processing message # {}", total_received);
-        let (data, _len) = inbound_server
+        let (data, _len, recv_timestamp) = inbound_server
             .poll_message(&server_listener, &mut recv_buffer)
             .unwrap();
-        let _resl = inbound_server.process_inbound_message(data).unwrap();
+        let _resl = inbound_server.process_inbound_message(data, recv_timestamp).unwrap();
         //println!("Finally, counter is {}", inbound_server.counter);
 
         //One new valid, non-duplicate message.
@@ -699,10 +711,12 @@ mod test {
         // Prevent tests from interfering with eachother over the localhost connection.
         // This should implicitly drop when the test ends.
 
+        let epoch_start = Instant::now();
+
         // Start a server
         let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
         let mut server =
-            InboundServer::new(server_addr.port(), record, epoch, counter_start);
+            InboundServer::new(server_addr.port(), record, epoch, epoch_start.clone(), counter_start);
         //server.counter = counter_start;
 
         let server_listener = UdpSocket::bind(server_addr)
@@ -1076,7 +1090,9 @@ mod test {
             // Start a server
             let server_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9999, 0, 0);
 
-            let mut server = InboundServer::new(server_addr.port(), record, 0, 0);
+            let epoch_start = Instant::now();
+
+            let mut server = InboundServer::new(server_addr.port(), record, 0, epoch_start.clone(), 0);
 
             let server_listener = UdpSocket::bind(server_addr)
                 .map_err(|e| SequencerError::CouldNotParse(format!("{:?}", e)))
@@ -1183,6 +1199,8 @@ mod test {
     fn end_to_end_client_service() { 
         use rkyv::Deserialize;
 
+        let epoch_start = Instant::now(); 
+
         let _guard = IO_TEST_PERMISSIONS.lock();
         CURRENT_OFFSET.store(0, atomic::Ordering::Relaxed);
         const NUM_TESTS: usize = 32;
@@ -1190,17 +1208,17 @@ mod test {
         //Ignore if it already exists.
         #[allow(unused_must_use)]
         {
-            std::fs::create_dir(Path::new("test_output/"));
+            std::fs::create_dir(PathBuf::from("test_output/"));
         }
-        let path = Path::new("test_output/messagebus");
+        let path = PathBuf::from("test_output/messagebus");
         // If a test failed, clean up after it.
         if path.exists() {
-            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(path.as_path()).unwrap();
         }
         let runtime = build_async_runtime().unwrap();
 
         // Load our record file.
-        let record = record::MemMapBackend::init(&path, 0).unwrap();
+        let record = record::MemMapBackend::init(path.as_path(), 0).unwrap();
         // Determine current offset.
         let initial_offset = record.initial_offset();
         CURRENT_OFFSET.store(initial_offset, atomic::Ordering::Relaxed);  

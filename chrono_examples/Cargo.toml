@@ -9,7 +9,7 @@ edition = "2021"
 sequencer_common = { path = "../sequencer_common" }
 iodaemon = { path = "../iodaemon" }
 
-rkyv = { version = "0.7", features = ["validation", "size_32", "alloc"] }
-
 clap = { version = "3.1", features = ["derive", "env"] }
 rand = "0.8"
+rkyv = { version = "0.7", features = ["validation", "size_32", "alloc"] }
+tokio = { version = "1.19", features = ["full", "time", "rt", "rt-multi-thread"] }

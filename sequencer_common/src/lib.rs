@@ -15,8 +15,10 @@ pub type ClusterId = u16;
 
 pub type LengthTag = u64;
 /// Number of nanoseconds since start of this epoch. 
-pub type Timestamp = u128;
+pub type Timestamp = u64;
 
+/// Ensure the size of our length tag fits in the ArchivedSequencerMessage's alignment, to prevent any misaligned
+/// structures in the message bus file. 
 const _: () =
     assert!(core::mem::size_of::<LengthTag>() == core::mem::align_of::<ArchivedSequencerMessage>());
 
